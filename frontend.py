@@ -65,8 +65,8 @@ with st.sidebar:
     # 2. 文件上传
     st.subheader("📄 文档上传")
     files = st.file_uploader(
-        "支持 .pdf / .txt / .md，可多选",
-        type=["pdf", "txt", "md"],
+        "支持 .pdf / .txt / .md / .json / .csv，可多选",
+        type=["pdf", "txt", "md", "json", "csv"],
         accept_multiple_files=True,
     )
     if st.button("上传并索引", disabled=not files):
@@ -79,14 +79,23 @@ with st.sidebar:
                 st.success(f"✅ {f.name}：{resp.get('chunk_count', 0)} 个文本块")
             else:
                 st.error(f"❌ {f.name}：{resp.get('detail', resp.get('error', code))}")
-    if st.button("查看已上传文档"):
-        code, resp = api("GET", "/api/doc/list")
-        docs = resp.get("docs", [])
-        if docs:
-            for d in docs:
+    code, resp = api("GET", "/api/doc/list")
+    docs = resp.get("docs", [])
+    if docs:
+        for d in docs:
+            col1, col2 = st.columns([4, 1])
+            with col1:
                 st.write(f"- {d['file_name']}（chunks={d['chunk_count']}）")
-        else:
-            st.info("暂无已上传文档")
+            with col2:
+                if st.button("🗑️", key=f"del_doc_{d['doc_id']}", help="删除该文档"):
+                    dc, dr = api("DELETE", f"/api/doc/{d['doc_id']}")
+                    if dc == 200:
+                        st.success(f"已删除 {d['file_name']}")
+                    else:
+                        st.error(f"删除失败：{dr.get('detail', dr.get('error', dc))}")
+                    st.rerun()
+    else:
+        st.info("暂无已上传文档")
 
     # 3. RAG 参数面板
     st.subheader("⚙️ RAG 参数")
@@ -115,6 +124,18 @@ with st.sidebar:
             ),
         )
         st.session_state["session_id"] = sel
+        # 删除当前选中的会话
+        if st.button("🗑️ 删除当前会话", key="del_session"):
+            dc, dr = api("DELETE", f"/api/session/{sel}")
+            if dc == 200:
+                st.success("会话已删除")
+                # 清空前端会话状态，避免继续引用已删除的 session_id
+                st.session_state.pop("session_id", None)
+                st.session_state.pop("history", None)
+                st.session_state.pop("loaded_sid", None)
+                st.rerun()
+            else:
+                st.error(f"删除失败：{dr.get('detail', dr.get('error', dc))}")
     else:
         st.info("暂无会话，请先新建")
 
@@ -136,20 +157,25 @@ if sid and sid != st.session_state.get("loaded_sid"):
 for msg in st.session_state["history"]:
     role = msg.get("role")
     content = msg.get("content")
-    with st.chat_message(role):
+    avatar = "🧑" if role == "user" else "🤖"
+    with st.chat_message(role, avatar=avatar):
         st.markdown(content)
         # 助手回答的折叠面板：来源 + 调试信息
         if role == "assistant" and "meta" in msg:
             meta = msg["meta"]
             with st.expander("📎 来源与置信度"):
                 for s in meta.get("sources", []):
-                    st.write(f"- [{s.get('index')}] {s.get('source')}")
-                    st.caption(s.get("content_preview", ""))
-                st.write(f"置信度：**{meta.get('confidence')}**")
+                    st.markdown(f"- **[{s.get('index')}]** {s.get('source')}")
+                    preview = s.get("content_preview", "")
+                    if preview:
+                        st.caption(preview)
+                st.markdown(f"**置信度：{meta.get('confidence')}**")
             with st.expander("🔍 调试信息"):
                 st.write("改写后 Query：", meta.get("rewritten_query"))
-                st.write("Multi-Query 子查询：", meta.get("sub_queries"))
-                st.write("Rerank 打分：", meta.get("rerank_scores"))
+                st.write("Multi-Query 子查询：")
+                st.json(meta.get("sub_queries", []))
+                st.write("Rerank 打分：")
+                st.json(meta.get("rerank_scores", []))
 
 # 聊天输入
 question = st.chat_input("输入你的问题...")

@@ -35,7 +35,7 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1000"))
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "BAAI/bge-m3")
 RERANKER_MODEL_NAME = os.getenv(
-    "RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    "RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3"
 )
 MULTI_QUERY_NUM = int(os.getenv("MULTI_QUERY_NUM", "3"))  # 多查询生成的子查询数量
 

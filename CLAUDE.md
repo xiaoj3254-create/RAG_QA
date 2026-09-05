@@ -10,7 +10,7 @@
 - 支持查询改写、多轮对话、来源输出、置信度打分；
 - **限制：没有持久化、没有文件解析、没有API、没有Web界面、没有reranker/multi‑query/幻觉校验。**
 
-**目标：改造升级为【档位2秋招简历完整项目】，不要全盘重写原有核心类，尽量复用已有业务逻辑，在此基础上扩展。** 项目定位：大模型应用方向秋招主力项目；前后端分离；可 Docker 部署；Streamlit Web UI；FastAPI 后端；Chroma持久化向量库；SQLite存储会话元数据。
+**目标：改造升级为生产级完整 RAG 项目，不要全盘重写原有核心类，尽量复用已有业务逻辑，在此基础上扩展。** 项目定位：大模型应用方向完整项目；前后端分离；可 Docker 部署；Streamlit Web UI；FastAPI 后端；Chroma持久化向量库；SQLite存储会话元数据。
 
 > ❗重要约束：不要抛弃原有 `RAGChain、DocumentProcessor、Retriever、Generator`，在原有类基础上扩展，而不是全部重写一套。
 
@@ -23,7 +23,7 @@ Streamlit Web前端 <--> FastAPI REST服务 <--> RAG核心模块(改造后的mai
                 ↓                         ↓
         Chroma向量库(磁盘持久化)      SQLite数据库(会话/文档元数据)
                 ↓
-        Groq LLM(Llama‑3.3‑70b) / OpenAI Embeddings / HuggingFace Cross‑Encoder reranker
+        DeepSeek LLM(硅基流动·OpenAI兼容协议) / 硅基流动 BAAI/bge-m3 Embeddings / 硅基流动 rerank API
 ```
 
 ## 项目目录结构（严格遵守）
@@ -43,7 +43,7 @@ rag_qa_system/
 │   └── chroma_db/            # Chroma持久化向量库目录（git忽略）
 └── utils/
     ├── file_loader.py        # PDF / TXT / MD 文件解析工具，输出LangChain Document列表
-    ├── reranker_helper.py    # Cross‑Encoder重排序、Multi‑Query生成工具函数
+    ├── reranker_helper.py    # 重排序（硅基流动 rerank API 优先，本地CrossEncoder兜底）、Multi‑Query生成工具函数
     └── logger.py             # 统一日志工具
 ```
 
@@ -59,15 +59,15 @@ rag_qa_system/
 
 - 默认RAG参数：chunk_size, chunk_overlap, top_k
 
-- reranker模型名称、groq模型名称
+- reranker模型名称、LLM生成模型名称（DeepSeek）、Embedding模型名称（BAAI/bge-m3）
 
   > 所有硬编码常量迁移到 config，代码各处导入 config 使用。
 
 ### 2. utils/file_loader.py
 
-输入：本地文件路径 / 上传文件二进制；支持 `.txt .md .pdf` 输出：`List[langchain_core.documents.Document]`，携带 source 元数据。
+输入：本地文件路径 / 上传文件二进制；支持 `.txt .md .pdf .json .csv` 输出：`List[langchain_core.documents.Document]`，携带 source 元数据。
 
-- PDF 使用 PyPDF2 提取文本；txt/md直接读取文本；
+- PDF 使用 PyPDFLoader(pypdf) 提取文本；txt/md 编码自动回退（utf-8/gbk/latin-1）；json 走 JSONLoader(jq)；csv 走 CSVLoader；
 - 增加异常捕获：损坏文件、空文件处理。
 
 ### 3. utils/reranker_helper.py
@@ -75,7 +75,7 @@ rag_qa_system/
 两个功能函数：
 
 1. `multi_query_generate(original_query:str, llm, num_queries=3) -> list[str]` 输入原始问题，调用LLM生成多个角度的子查询，用于多查询召回；返回子查询列表。
-2. `rerank_documents(query:str, docs:List[Document], top_n:int, model_name:str) -> List[Document]` 使用 sentence‑transformers Cross‑Encoder 对检索得到文档做重排序，返回重排后的文档列表。
+2. `rerank_documents(query:str, docs:List[Document], top_n:int, model_name:str) -> List[Document]` 对检索得到文档做重排序：优先走硅基流动 /rerank API（模型 `BAAI/bge-reranker-v2-m3`），不可用时降级本地 sentence-transformers CrossEncoder，返回重排后的文档列表。
 
 ### 4. utils/logger.py
 
@@ -125,7 +125,7 @@ if is_hallucination == False → evaluate → END
 
 > 在RAGState TypedDict增加字段：`is_hallucination:bool, retry_count:int, sub_queries:List[str]`
 
-1. Embedding逻辑：优先OpenAIEmbeddings；没有密钥回退SimpleEmbeddings；打印警告提示生产不要使用SimpleEmbeddings。
+1. Embedding逻辑：优先通过硅基流动（OpenAI 兼容协议）调用 BAAI/bge-m3；没有密钥回退SimpleEmbeddings；打印警告提示生产不要使用SimpleEmbeddings。
 2. 完善异常捕获：LLM调用异常、向量库异常捕获。
 3. RAGChain.index_documents() 支持接收文件路径列表，内部调用 utils.file_loader，不再只接收文本字符串。
 
@@ -166,14 +166,14 @@ if is_hallucination == False → evaluate → END
 
 需要包含：
 
-1. 项目简介、简历项目定位
+1. 项目简介
 2. 系统架构文本/ASCII图
 3. 功能特性列表
 4. 环境部署步骤：本地运行方式、docker运行方式；.env配置示例
 5. 模块说明
 6. RAG优化策略说明：Multi‑Query、Reranker、幻觉自检条件分支、查询改写
 7. 调优实验说明：不同chunk_size、top‑k对效果的影响
-8. 项目局限与未来改进方向（用于面试）
+8. 项目局限与未来改进方向
 
 ## 输出要求告诉 Claude
 
@@ -181,8 +181,6 @@ if is_hallucination == False → evaluate → END
 2. **最大限度复用原始main.py已有类结构，不要全部推倒重写；只做扩展与替换向量存储；**
 3. 代码中写必要注释；关键逻辑（LangGraph条件边幻觉重试）写注释；
 4. .env提供模板 `.env.example`；
-5. 输出完成之后，给一份简历项目描述文本，直接复制到秋招简历使用；
-6. 额外输出一份面试重点问题清单，针对本项目，方便后续面试准备。
 
 ## 补充给 Claude 的提示（防止踩坑）
 

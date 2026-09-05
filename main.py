@@ -1,20 +1,20 @@
 """
-RAG 检索增强生成系统 - 完整实现（秋招升级版）
+RAG 检索增强生成系统 - 完整实现
 
 本模块实现了生产级别的 RAG 系统，包括：
 - 文档加载和处理（支持 Chroma 磁盘持久化）
-- 向量存储和检索（Multi-Query 多路召回 + Cross-Encoder 重排）
+- 向量存储和检索（Multi-Query 多路召回 + 硅基流动 rerank 重排）
 - 上下文感知的问答生成（幻觉自检 + LangGraph 条件分支重试）
 - 来源引用和置信度评估
 
 ⚠️ Embeddings 说明：
 - 默认使用简单的 Fake Embeddings（用于演示）
-- 如需高质量结果，请设置 OPENAI_API_KEY 使用 OpenAI Embeddings
+- 如需高质量结果，请在 .env 中配置 OPENAI_API_KEY（硅基流动密钥），通过 OpenAI 兼容协议调用硅基流动的 BAAI/bge-m3 向量模型
 - 使用 SimpleEmbeddings 时程序会打印警告，生产环境必须配置真实 Embedding
 
-⚠️ LLM 说明：
-- 优先使用 Groq（llama-3.3-70b）：未配置密钥时自动进入演示降级模式
-- 降级模式下仍可跑通检索、来源、子查询、重排、幻觉校验全流程
+⚠️ LLM / Embedding 说明：
+- 统一走 OpenAI 兼容协议接硅基流动（SiliconFlow），默认生成模型 deepseek-ai/DeepSeek-V4-Flash，向量模型 BAAI/bge-m3；
+  未配置密钥时自动进入演示降级模式，仍可跑通检索、来源、子查询、重排、幻觉校验全流程
 """
 
 import re
@@ -30,7 +30,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.embeddings import Embeddings
 
 # 文本处理
@@ -52,12 +51,12 @@ logger = setup_logger("rag", config.LOG_FILE)
 load_dotenv()
 
 
-# 初始化 Groq 模型（懒加载单例：生成/改写/多查询/幻觉检测共用同一实例）
+# 初始化生成模型（懒加载单例：生成/改写/多查询/幻觉检测共用同一实例）
 _model: Any = None
 
 
 def deepseek_model():
-    """懒加载 Groq LLM 单例；无有效密钥时抛出 ValueError。"""
+    """懒加载生成 LLM 单例；无有效密钥时抛出 ValueError。"""
     global _model
     if _model is None:
         if not config.DEEPSEEK_API_KEY or config.DEEPSEEK_API_KEY.startswith("your_"):
@@ -76,7 +75,7 @@ class SimpleEmbeddings(Embeddings):
     简单的 Embeddings 实现（用于演示）
 
     使用简单的文本哈希生成确定性伪随机向量，适合演示目的。
-    生产环境请使用 OpenAI 或 HuggingFace Embeddings。
+    生产环境请通过硅基流动（OpenAI 兼容协议）或 HuggingFace 使用真实语义 Embedding。
     """
 
     def __init__(self, dimension: int = 384):
@@ -115,7 +114,7 @@ def get_embeddings():
     if config.OPENAI_API_KEY and not config.OPENAI_API_KEY.startswith("your_"):
         try:
             from langchain_openai import OpenAIEmbeddings
-            logger.info("使用 OpenAI Embeddings: %s（base: %s）",
+            logger.info("使用硅基流动 Embeddings（OpenAI 兼容协议）: %s（base: %s）",
                         config.OPENAI_EMBEDDING_MODEL, config.OPENAI_API_BASE)
             # timeout=30：embed_documents 批量嵌入可能较慢，10s 不够
             return OpenAIEmbeddings(
@@ -123,6 +122,10 @@ def get_embeddings():
                 base_url=config.OPENAI_API_BASE,
                 api_key=config.OPENAI_API_KEY,
                 timeout=30,
+                # 硅基流动等非 OpenAI 厂商不接受 langchain 默认的 tokenize 分片后
+                # 提交的 token 整数数组（会 400 The parameter is invalid）。
+                # 关闭后直接提交原始文本字符串，兼容多路接入。
+                check_embedding_ctx_length=False,
             )
         except ImportError:
             logger.warning("langchain_openai 未安装，使用简单 Embeddings")
@@ -222,7 +225,7 @@ class DocumentProcessor:
         """检测已持久化向量维度与当前 Embedding 是否一致。
 
         常见踩坑：先用 SimpleEmbeddings(384 维) 写入 Chroma，之后配置 OPENAI_API_KEY
-        重启后改用 OpenAIEmbeddings(1536 维)。维度不一致会导致每次检索都报错，
+        重启后改用硅基流动 BAAI/bge-m3(1024 维)。维度不一致会导致每次检索都报错，
         而检索节点会静默吞掉异常返回空结果——表现为"什么都搜不到"，极难排查。
         这里显式检测并在日志中大声警告；同时清空该 collection，让新上传的文档
         以新维度重建索引（向量只是派生数据，源文档仍在，重新上传即可恢复）。
@@ -245,7 +248,7 @@ class DocumentProcessor:
 
             logger.error(
                 "⚠️ Embedding 维度不兼容：库中已有的向量维度为 %d，当前 Embedding 生成 %d 维。"
-                "这是简单Embedding与OpenAI Embedding切换导致的。仅删除向量无法生效，"
+                "这是 SimpleEmbeddings 与硅基流动 BAAI/bge-m3 切换导致的。仅删除向量无法生效，"
                 "因为 collection 的 HNSW 维度元数据仍停留在旧维度；这里直接删除并重建 collection，"
                 "请重新上传文档以新维度建立索引。",
                 stored_dim, current_dim,
@@ -297,6 +300,43 @@ class DocumentProcessor:
         if documents:
             self.vector_store.add_documents(documents)
         return self.vector_store
+
+    def delete_documents_by_doc_id(self, doc_id: str, source: Optional[str] = None) -> int:
+        """从 Chroma 中删除指定文档的所有 chunk，返回删除数量。
+
+        删除策略（两级匹配，兼容历史数据）：
+        1. 优先按 doc_id 精确匹配（新上传的文档在入库时已注入 doc_id）；
+        2. 若按 doc_id 未命中，且提供了 source（文件名），则按 source 包含文件名兜底匹配
+           （兼容早期上传、未注入 doc_id 的历史 chunk）。
+        """
+        store = getattr(self.vector_store, "_collection", None)
+        if store is None:
+            logger.warning("向量库无 _collection（可能是内存兜底），跳过删除")
+            return 0
+        try:
+            # 第一级：按 doc_id 精确匹配
+            result = store.get(where={"doc_id": doc_id}, include=[])
+            ids = result.get("ids", []) or []
+
+            # 第二级：doc_id 未命中时，按 source 兜底匹配（兼容历史数据）
+            # 注意：chromadb 的 $contains 仅用于列表字段，不支持字符串子串匹配，
+            # 因此拉取全部 metadata 在 Python 端做子串过滤。
+            if not ids and source:
+                all_data = store.get(include=["metadatas"])
+                ids = [
+                    cid for cid, meta in zip(all_data["ids"], all_data["metadatas"])
+                    if meta and source in (meta.get("source") or "")
+                ]
+                if ids:
+                    logger.info("doc_id=%s 无匹配，改用 source 兜底匹配到 %d 个 chunk", doc_id, len(ids))
+
+            if ids:
+                store.delete(ids=ids)
+                logger.info("已从 Chroma 删除 doc_id=%s 的 %d 个 chunk", doc_id, len(ids))
+            return len(ids)
+        except Exception as e:
+            logger.warning("Chroma 删除失败 doc_id=%s: %s", doc_id, e)
+            return 0
 
     def process(self, texts: List[str], metadatas: Optional[List[Dict]] = None):
         """完整处理流程：加载 -> 分块 -> 追加向量化"""
@@ -355,19 +395,6 @@ class Retriever:
                 break
         return merged
 
-    def retrieve_with_scores(self, query: str) -> List[tuple]:
-        """检索文档并返回相似度分数"""
-        return self.vector_store.similarity_search_with_score(  # 返回 `List[ (Document, score) ]` **元组列表**
-            query=query,
-            k=self.config.top_k
-        )
-
-            ## 小坑点
-            # 1. `retrieve_multi` 的去重是**精确文本匹配**，文本差一个字符就判定为不同文档，无法做模糊去重。
-            # 2. `similarity_search_with_score` 返回的 score，Chroma 是**距离值，不是相似度 (0~1)**，不要直接当做相似度概率判断。
-            # 3. 提前 break 是跳出外层`for q in queries`循环，不再处理剩下的子查询，减少向量库请求。
-
-
 # ==================== 生成模块 ====================
 
 class Generator:
@@ -375,7 +402,7 @@ class Generator:
 
     def __init__(self, config: RAGConfig):
         self.config = config
-        self.llm: Any = None  # 懒加载 Groq 模型，无密钥时保持 None 进入降级模式
+        self.llm: Any = None  # 懒加载生成模型，无密钥时保持 None 进入降级模式
 
         # RAG 提示模板
         self.rag_prompt = ChatPromptTemplate.from_messages([
@@ -416,7 +443,7 @@ class Generator:
         ])
 
     def _llm_available(self) -> bool:
-        """判断是否有可用的 Groq LLM（无密钥时进入降级模式）。"""
+        """判断是否有可用的生成 LLM（无密钥时进入降级模式）。"""
         return bool(config.DEEPSEEK_API_KEY) and not config.DEEPSEEK_API_KEY.startswith("your_")
 
     def _get_llm(self):
@@ -638,7 +665,7 @@ class RAGChain:
             return state
 
         def rerank_node(state: RAGState) -> RAGState:
-            """Reranker 节点：对检索结果做 Cross-Encoder 重排序（失败时保持原顺序）"""
+            """Reranker 节点：对检索结果重排序（优先硅基流动 /rerank API，失败时保持原顺序）"""
             if self.config.enable_reranker and state.get("documents"):
                 try:
                     docs = reranker_helper.rerank_documents(

@@ -11,6 +11,7 @@
 """
 import os
 import threading
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -105,10 +106,10 @@ async def upload_doc(file: UploadFile = File(...)):
     if len(content) > max_bytes:
         raise HTTPException(413, f"文件超过 {config.MAX_UPLOAD_MB}MB 限制")
 
-    # 后缀校验
+    # 后缀校验（与 utils/file_loader.py 的 SUPPORTED_EXTS 保持一致）
     suffix = Path(filename).suffix.lower()
-    if suffix not in {".txt", ".md", ".pdf"}:
-        raise HTTPException(400, "仅支持 txt/md/pdf 文件")
+    if suffix not in {".txt", ".md", ".pdf", ".json", ".csv"}:
+        raise HTTPException(400, "仅支持 txt/md/pdf/json/csv 文件")
 
     # 写临时文件后走 file_loader 解析（复用 PDF/编码兜底逻辑）
     # tmp 目录固定在项目根下，避免按 CHROMA_DB_PATH 推断依赖进程 CWD 而分叉
@@ -128,14 +129,19 @@ async def upload_doc(file: UploadFile = File(...)):
     # 分块 + 追加到 Chroma；retriever 重关联与建图是单例状态变更，
     # 与 chat 的配置覆盖/恢复共用锁，避免并发竞态
     rag = get_rag()
+    # 预生成 doc_id，注入每个 chunk 的 metadata，建立「SQLite 文档 ↔ Chroma 向量」关联，
+    # 后续删除文档时可按 doc_id 精准定位并删除对应向量。
+    doc_id = uuid.uuid4().hex
     with _config_lock:
         chunks = rag.processor.split_documents(docs)
+        for c in chunks:
+            c.metadata["doc_id"] = doc_id
         rag.processor.create_vector_store(chunks)
         rag.retriever = Retriever(rag.processor.vector_store, rag.config)
         rag._build_graph()
 
     # 记录元数据到 SQLite
-    doc_id = sqlite_db.add_uploaded_doc_meta(filename, len(chunks))
+    sqlite_db.add_uploaded_doc_meta(filename, len(chunks), doc_id=doc_id)
     return {"doc_id": doc_id, "file_name": filename, "chunk_count": len(chunks)}
 
 
@@ -143,6 +149,31 @@ async def upload_doc(file: UploadFile = File(...)):
 def list_docs():
     """获取已上传文档元数据列表。"""
     return {"docs": sqlite_db.list_uploaded_docs()}
+
+
+@app.delete("/api/doc/{doc_id}")
+def delete_doc(doc_id: str):
+    """删除已上传文档：同时清理 Chroma 向量与 SQLite 元数据。
+
+    先删 Chroma 向量（按 doc_id 过滤），再删 SQLite 记录；
+    若 Chroma 删除失败仍继续删元数据，避免残留死记录。
+    """
+    doc = sqlite_db.get_uploaded_doc(doc_id)
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+
+    rag = get_rag()
+    # 向量与元数据分两步，互不阻塞：即使 Chroma 删除异常，元数据也要清掉
+    # 传入 file_name 作为 source 兜底匹配，兼容早期未注入 doc_id 的历史 chunk
+    with _config_lock:
+        deleted_chunks = rag.processor.delete_documents_by_doc_id(doc_id, source=doc["file_name"])
+    sqlite_db.delete_uploaded_doc(doc_id)
+    logger.info("删除文档: %s (chunks_removed=%d)", doc["file_name"], deleted_chunks)
+    return {
+        "doc_id": doc_id,
+        "file_name": doc["file_name"],
+        "deleted_chunks": deleted_chunks,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -251,3 +282,12 @@ def session_history(session_id: str):
     if not msgs and not any(s["session_id"] == session_id for s in sqlite_db.get_all_sessions()):
         raise HTTPException(404, "会话不存在")
     return {"session_id": session_id, "messages": msgs}
+
+
+@app.delete("/api/session/{session_id}")
+def delete_session(session_id: str):
+    """删除会话及其全部历史消息。"""
+    deleted = sqlite_db.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(404, "会话不存在")
+    return {"session_id": session_id, "deleted": True}

@@ -96,6 +96,23 @@ def get_all_sessions() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def delete_session(session_id: str) -> bool:
+    """删除会话及其全部消息。
+
+    messages 表外键未声明 ON DELETE CASCADE，因此先删消息再删会话，
+    避免外键约束报错。返回 True 表示确实删除了一条会话记录；False 表示会话不存在。
+    """
+    with _connect() as conn:
+        conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
+        cur = conn.execute(
+            "DELETE FROM sessions WHERE session_id=?", (session_id,)
+        )
+        deleted = cur.rowcount > 0
+    if deleted:
+        logger.info("删除会话: %s", session_id)
+    return deleted
+
+
 # ----------------------------------------------------------------------
 # 消息
 # ----------------------------------------------------------------------
@@ -137,9 +154,14 @@ def get_session_messages(session_id: str) -> List[Dict[str, Any]]:
 # ----------------------------------------------------------------------
 # 上传文档元数据
 # ----------------------------------------------------------------------
-def add_uploaded_doc_meta(file_name: str, chunk_count: int) -> str:
-    """写入上传文档元数据，返回 doc_id。"""
-    doc_id = uuid.uuid4().hex
+def add_uploaded_doc_meta(file_name: str, chunk_count: int, doc_id: Optional[str] = None) -> str:
+    """写入上传文档元数据，返回 doc_id。
+
+    doc_id 可选：由调用方（api.py）预先生成，以便在写入 Chroma 前
+    把 doc_id 注入 chunk 元数据，建立「SQLite 文档 ↔ Chroma 向量」的关联。
+    """
+    if doc_id is None:
+        doc_id = uuid.uuid4().hex
     with _connect() as conn:
         conn.execute(
             "INSERT INTO uploaded_docs(doc_id, file_name, chunk_count, upload_time)"
@@ -148,6 +170,27 @@ def add_uploaded_doc_meta(file_name: str, chunk_count: int) -> str:
         )
     logger.info("记录上传文档: %s (chunks=%d)", file_name, chunk_count)
     return doc_id
+
+
+def get_uploaded_doc(doc_id: str) -> Optional[Dict[str, Any]]:
+    """按 doc_id 查询上传文档元数据；不存在返回 None。"""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM uploaded_docs WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_uploaded_doc(doc_id: str) -> bool:
+    """删除上传文档元数据记录。返回 True 表示确实删除了一条；False 表示不存在。"""
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM uploaded_docs WHERE doc_id=?", (doc_id,)
+        )
+        deleted = cur.rowcount > 0
+    if deleted:
+        logger.info("删除上传文档元数据: %s", doc_id)
+    return deleted
 
 
 def list_uploaded_docs() -> List[Dict[str, Any]]:

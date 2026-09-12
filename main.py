@@ -43,7 +43,7 @@ from langgraph.graph import StateGraph, START, END
 
 # 项目内部模块
 from utils.logger import setup_logger
-from utils import file_loader, reranker_helper
+from utils import file_loader, reranker_helper, bm25_helper
 
 logger = setup_logger("rag", config.LOG_FILE)
 
@@ -167,6 +167,10 @@ class RAGConfig:
     multi_query_num: int = config.MULTI_QUERY_NUM
     reranker_model_name: str = config.RERANKER_MODEL_NAME
 
+    # 混合检索（BM25 稀疏 + 向量稠密，RRF 融合）
+    enable_hybrid_search: bool = config.ENABLE_HYBRID_SEARCH
+    bm25_candidate_k: int = config.BM25_CANDIDATE_K
+
 
 # ==================== 状态定义 ====================
 
@@ -203,6 +207,9 @@ class DocumentProcessor:
         self.embeddings = get_embeddings()  # 使用智能选择的 Embeddings
         self.vector_store = None
         self._create_vector_store()  # 启动即创建/加载一次，避免重复实例化
+        # BM25 稀疏检索索引（与向量库同一份语料；归 DocumentProcessor 持有，
+        # 因为增删文档后由此负责失效标记；Retriever 只读检索）
+        self.bm25 = bm25_helper.BM25Helper(self.vector_store)
 
     def _create_vector_store(self) -> None:
         """创建 Chroma 持久化向量库（加载已有数据，不重建）；失败回退内存向量库。"""
@@ -333,60 +340,110 @@ class DocumentProcessor:
             if ids:
                 store.delete(ids=ids)
                 logger.info("已从 Chroma 删除 doc_id=%s 的 %d 个 chunk", doc_id, len(ids))
+                self.bm25.invalidate()  # 语料已变更，BM25 索引待重建
             return len(ids)
         except Exception as e:
             logger.warning("Chroma 删除失败 doc_id=%s: %s", doc_id, e)
             return 0
 
-    def process(self, texts: List[str], metadatas: Optional[List[Dict]] = None):
-        """完整处理流程：加载 -> 分块 -> 追加向量化"""
-        logger.info("加载文档...")
-        documents = self.load_documents(texts, metadatas)
-        logger.info("加载了 %d 个文档", len(documents))
+    def process(self, documents: List[Document], doc_id: Optional[str] = None) -> int:
+        """Document 入库统一入口：注入 doc_id → 分块 → 追加向量化，返回 chunk 数。
+
+        若传入 doc_id，会注入每个 Document 的 metadata，建立 SQLite 文档 ↔ Chroma 向量关联。
+        api.py 上传流程与 index_documents 纯文本分支均通过此入口入库。
+        """
+        if doc_id:
+            for doc in documents:
+                doc.metadata["doc_id"] = doc_id
 
         logger.info("分割文档...")
         chunks = self.split_documents(documents)
         logger.info("生成了 %d 个文本块", len(chunks))
 
         logger.info("写入向量存储...")
-        vector_store = self.create_vector_store(chunks)
+        self.create_vector_store(chunks)
         logger.info("向量存储更新完成")
-        return vector_store
+        self.bm25.invalidate()  # 语料已变更，BM25 索引待重建
+        return len(chunks)
 
-    def process_paths(self, paths: List[str]) -> int:
-        """文件路径入口：解析文件 -> 分块 -> 追加向量化，返回 chunk 数。"""
+    def process_paths(self, paths: List[str], doc_id: Optional[str] = None) -> int:
+        """文件路径入口：解析文件 -> 分块 -> 追加向量化，返回 chunk 数。
+
+        解析后复用 process() 统一入库（支持 doc_id 注入）。
+        """
         docs = file_loader.load_files(paths)
         if not docs:
             logger.warning("没有成功解析到任何文件")
             return 0
-        chunks = self.split_documents(docs)
-        self.create_vector_store(chunks)
-        logger.info("已索引 %d 个文件，共 %d 个文本块", len(docs), len(chunks))
-        return len(chunks)
+        return self.process(docs, doc_id=doc_id)
 
 
 # ==================== 检索模块 ====================
 
 class Retriever:
-    """检索器：从向量存储中检索相关文档（支持单路与多路召回）"""
+    """检索器：向量稠密检索 + BM25 稀疏检索，RRF 融合（可降级为纯向量）"""
 
-    def __init__(self, vector_store, config: RAGConfig):
+    def __init__(self, vector_store, config: RAGConfig, bm25: Optional[bm25_helper.BM25Helper] = None):
         self.vector_store = vector_store
         self.config = config
+        # BM25 索引由 DocumentProcessor 持有并随增删失效；未传入时自建（独立使用场景）
+        self.bm25 = bm25 or bm25_helper.BM25Helper(vector_store)
+
+    def _vector_search(self, query: str, k: int) -> List[Document]:
+        """向量单路检索（异常返回空列表，不中断融合）"""
+        try:
+            return self.vector_store.similarity_search(query=query, k=k)
+        except Exception as e:
+            logger.warning("向量检索失败 q=%s: %s", query, e)
+            return []
+
+    def _hybrid_search(self, query: str) -> List[List[Document]]:
+        """对单条查询执行 向量 + BM25 双路召回，返回结果列表（供 RRF 融合）"""
+        lists = [self._vector_search(query, self.config.top_k)]
+        bm25_docs = self.bm25.search(query, k=self.config.bm25_candidate_k)
+        if bm25_docs:
+            lists.append(bm25_docs)
+        return lists
 
     def retrieve(self, query: str) -> List[Document]:
-        """单路检索"""
-        return self.vector_store.similarity_search(
-            query=query,
-            k=self.config.top_k
+        """单路检索（混合开关开启时为向量+BM25 双路 RRF 融合）"""
+        if not self.config.enable_hybrid_search:
+            return self._vector_search(query, self.config.top_k)
+
+        lists = self._hybrid_search(query)
+        if len(lists) <= 1:
+            return lists[0] if lists else []
+        fused = bm25_helper.rrf_fuse(
+            lists, rrf_k=config.RRF_K, top_n=self.config.top_k * 2
         )
+        logger.info("混合检索（单路）：%d 路融合 → %d 个候选", len(lists), len(fused))
+        return fused
 
     def retrieve_multi(self, queries: List[str]) -> List[Document]:
-        """多查询召回：逐条检索，按内容去重合并（适度扩容候选供重排筛选）"""
+        """多查询召回。
+
+        混合模式：每个子查询做 向量+BM25 双路召回，所有结果统一 RRF 融合——
+        被多个子查询/多路同时命中的 chunk 排名自然靠前（跨查询共识）。
+        纯向量模式：保留原有逐条检索、按内容去重合并逻辑。
+        """
+        if self.config.enable_hybrid_search:
+            all_lists: List[List[Document]] = []
+            for q in queries:
+                all_lists.extend(self._hybrid_search(q))
+            if not all_lists:
+                return []
+            fused = bm25_helper.rrf_fuse(
+                all_lists, rrf_k=config.RRF_K, top_n=self.config.top_k * 3
+            )
+            logger.info("混合检索（多路）：%d 个子查询 × 2 路 = %d 路结果，RRF 融合 → %d 个候选",
+                        len(queries), len(all_lists), len(fused))
+            return fused
+
+        # 纯向量多路召回（原逻辑）
         seen = set()
         merged: List[Document] = []
         for q in queries:
-            for doc in self.vector_store.similarity_search(query=q, k=self.config.top_k):
+            for doc in self._vector_search(q, self.config.top_k):
                 if doc.page_content not in seen:
                     seen.add(doc.page_content)
                     merged.append(doc)
@@ -579,7 +636,8 @@ class RAGChain:
     def __init__(self, config: RAGConfig = None):
         self.config = config or RAGConfig()
         self.processor = DocumentProcessor(self.config)
-        self.retriever = Retriever(self.processor.vector_store, self.config)
+        self.retriever = Retriever(self.processor.vector_store, self.config,
+                                   bm25=self.processor.bm25)
         self.generator = Generator(self.config)
         self.graph = None
 
@@ -590,10 +648,13 @@ class RAGChain:
             chunk_count = self.processor.process_paths(texts)
             logger.info("已从文件索引 %d 个文本块", chunk_count)
         else:
-            self.processor.process(texts, metadatas)
+            # 纯文本列表：load_documents 转 Document 后走统一入库入口
+            documents = self.processor.load_documents(texts, metadatas)
+            self.processor.process(documents)
 
         # 重新关联 retriever 与最新的向量库（Chroma 模式下始终同一实例）
-        self.retriever = Retriever(self.processor.vector_store, self.config)
+        self.retriever = Retriever(self.processor.vector_store, self.config,
+                                   bm25=self.processor.bm25)
         self._build_graph()
 
     def _build_graph(self):

@@ -30,5 +30,9 @@ jq>=1.7
 langchain-chroma>=0.1
 chromadb>=0.5
 
+# ---- 混合检索（BM25 稀疏检索 + jieba 中文分词）----
+rank-bm25>=0.2.2
+jieba>=0.42
+
 # ---- 重排（重型依赖，含 torch；安装失败时程序自动降级跳过重排）----
 sentence-transformers>=3.0

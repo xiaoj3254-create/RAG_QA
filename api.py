@@ -133,16 +133,15 @@ async def upload_doc(file: UploadFile = File(...)):
     # 后续删除文档时可按 doc_id 精准定位并删除对应向量。
     doc_id = uuid.uuid4().hex
     with _config_lock:
-        chunks = rag.processor.split_documents(docs)
-        for c in chunks:
-            c.metadata["doc_id"] = doc_id
-        rag.processor.create_vector_store(chunks)
-        rag.retriever = Retriever(rag.processor.vector_store, rag.config)
+        # process() 统一入口：内部完成 doc_id 注入 → 分块 → 追加向量化
+        chunk_count = rag.processor.process(docs, doc_id=doc_id)
+        rag.retriever = Retriever(rag.processor.vector_store, rag.config,
+                                  bm25=rag.processor.bm25)
         rag._build_graph()
 
     # 记录元数据到 SQLite
-    sqlite_db.add_uploaded_doc_meta(filename, len(chunks), doc_id=doc_id)
-    return {"doc_id": doc_id, "file_name": filename, "chunk_count": len(chunks)}
+    sqlite_db.add_uploaded_doc_meta(filename, chunk_count, doc_id=doc_id)
+    return {"doc_id": doc_id, "file_name": filename, "chunk_count": chunk_count}
 
 
 @app.get("/api/doc/list")

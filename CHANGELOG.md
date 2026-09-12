@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-09-12 — BM25 混合检索（BM25 稀疏 + 向量稠密 + RRF 融合）
+
+背景：纯向量检索对"第6条"这类编号/关键词查询召回不准——语义相似度对数字编号无区分度。引入 BM25 稀疏检索补足字面精确匹配，两路结果经 RRF 融合，兼顾语义相关性与关键词命中。
+
+### 改动内容
+
+| # | 改动 | 文件 | 说明 |
+|---|------|------|------|
+| 1 | 新建 BM25 稀疏检索辅助模块 | [utils/bm25_helper.py](utils/bm25_helper.py) | `BM25Helper` 从 Chroma 语料懒构建索引（rank-bm25 + jieba 分词，与向量检索同一份数据）；`rrf_fuse` 按名次贡献 1/(rrf_k+rank) 融合多路排序；依赖缺失/索引失败/检索异常均返回空列表，主链路自动回退纯向量 |
+| 2 | 法条编号归一化 | [utils/bm25_helper.py](utils/bm25_helper.py) | 检索前把 `第6条` → `第六条`（覆盖条/款/章/项，1~999），消除用户查询（阿拉伯数字）与法条原文（汉字数字）风格不一致导致的 BM25 分词完全错开 |
+| 3 | Retriever 支持混合检索 | [main.py](main.py) | `retrieve`/`retrieve_multi` 均改为 向量+BM25 双路召回 + RRF 统一融合（多子查询跨路共识排名）；`ENABLE_HYBRID_SEARCH=0` 时保留原纯向量逻辑 |
+| 4 | BM25 索引生命周期管理 | [main.py](main.py) / [api.py](api.py) | `BM25Helper` 归 `DocumentProcessor` 持有（语料写入方负责失效）；`process`/`delete_documents_by_doc_id` 后自动 `invalidate()`，下次检索按需重建（另有 chunk 数脏检测兜底）；api.py 上传后重建 Retriever 时传入同一实例，避免索引失联 |
+| 5 | 混合检索配置项 | [config.py](config.py) | `ENABLE_HYBRID_SEARCH`（默认开）、`BM25_CANDIDATE_K=5`（BM25 每路候选数）、`RRF_K=60`（融合平滑常数） |
+| 6 | 依赖清单 | [requirements.txt](requirements.txt) | 添加 `rank-bm25>=0.2.2`、`jieba>=0.42` |
+
+### 验证情况
+
+- ✅ 全部改动文件 `py_compile` 语法检查通过
+- ✅ 归一化：`tokenize('第6条')` 与 `tokenize('第六条')` 分词一致（共享 token `第六条`）
+- ✅ 编号类查询"刑法第6条是什么"：BM25 top1 精准命中第六条；混合融合 top1 命中，候选扩至 7 个供重排筛选
+- ✅ 语义类查询（"在中国船只飞机里犯罪适用哪国法律"）：混合 top1 命中含"船舶"的第六条，无劣化
+- ✅ 增删文档后索引自动同步：删除测试文档后 BM25 重建（157→152 chunks）
+- ✅ 测试脚本已删除，向量库零测试残留
+
+### 建议提交信息
+
+```
+feat: hybrid retrieval with BM25 sparse search + vector dense search fused by RRF
+
+- add utils/bm25_helper.py: lazy BM25 index over Chroma corpus (rank-bm25 + jieba)
+- normalize legal article numbers (第6条 -> 第六条) to fix BM25 token mismatch
+- fuse vector + BM25 result lists via Reciprocal Rank Fusion (k=60)
+- invalidate BM25 index on document add/delete; share instance across Retriever rebuilds
+- add ENABLE_HYBRID_SEARCH / BM25_CANDIDATE_K / RRF_K config switches
+```
+
+---
+
 ## 2026-09-01 — 代码审查修复（6 处，6 个文件）
 
 源自一轮 code-review 发现的真实问题，全部已修复。

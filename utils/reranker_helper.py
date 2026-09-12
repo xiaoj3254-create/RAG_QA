@@ -19,6 +19,10 @@ from utils.logger import setup_logger
 
 logger = setup_logger("reranker", config.LOG_FILE)
 
+# 本地 CrossEncoder 单例缓存：按 model_name 键存，进程内只加载一次，
+# 避免每次问答重复实例化模型（含首次联网下载）。
+_local_model_cache: dict = {}
+
 
 def multi_query_generate(original_query: str, llm, num_queries: int = 3) -> List[str]:
     """调用 LLM 从不同角度生成 num_queries 个检索子查询。
@@ -151,6 +155,29 @@ def _rerank_via_api(
     return None
 
 
+def _get_local_reranker(model_name: str):
+    """获取本地 CrossEncoder 单例（懒加载 + 按模型名缓存）。
+
+    首次调用时加载 sentence-transformers 并实例化模型写入模块级缓存；
+    后续调用直接返回缓存实例，避免重复加载/下载。依赖缺失返回 None。
+    """
+    if model_name in _local_model_cache:
+        return _local_model_cache[model_name]
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as e:
+        logger.warning("sentence-transformers 未安装或加载失败，跳过重排: %s", e)
+        return None
+    try:
+        model = CrossEncoder(model_name)  # CPU 可推理；模型需已在本地缓存或可联网下载
+        _local_model_cache[model_name] = model
+        logger.info("本地重排模型已加载并缓存: %s", model_name)
+        return model
+    except Exception as e:
+        logger.error("本地重排模型加载失败: %s", e)
+        return None
+
+
 def _rerank_local(
     query: str,
     docs: List[Document],
@@ -158,15 +185,12 @@ def _rerank_local(
     model_name: str,
 ) -> List[Document]:
     """本地 sentence-transformers CrossEncoder 重排（失败降级原顺序）。"""
-    try:
-        from sentence_transformers import CrossEncoder
-        import numpy as np
-    except ImportError as e:
-        logger.warning("sentence-transformers 未安装或加载失败，跳过重排: %s", e)
+    model = _get_local_reranker(model_name)
+    if model is None:
         return docs[:top_n]
 
     try:
-        model = CrossEncoder(model_name)  # CPU 可推理；模型需已在本地缓存或可联网下载
+        import numpy as np
         pairs = [(query, d.page_content) for d in docs]
         scores = model.predict(pairs)
         # 形状防御：部分 Cross-Encoder 返回 (n,1) 二维数组或标量，统一拍平成

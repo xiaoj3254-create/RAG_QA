@@ -52,3 +52,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # ----------------------------------------------------------------------
 ENABLE_MULTI_QUERY = os.getenv("ENABLE_MULTI_QUERY", "1").lower() in ("1", "true", "yes")
 ENABLE_RERANKER = os.getenv("ENABLE_RERANKER", "1").lower() in ("1", "true", "yes")
+
+# ----------------------------------------------------------------------
+# 混合检索（BM25 稀疏检索 + 向量稠密检索，RRF 融合）
+# ----------------------------------------------------------------------
+ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "1").lower() in ("1", "true", "yes")
+BM25_CANDIDATE_K = int(os.getenv("BM25_CANDIDATE_K", "5"))  # BM25 每路召回候选数
+RRF_K = int(os.getenv("RRF_K", "60"))                       # RRF 融合平滑常数（业界默认 60）

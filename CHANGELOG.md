@@ -1,5 +1,65 @@
 # Changelog
 
+## 2026-09-13 — .env 重排配置改为本地已缓存模型
+
+### 改动内容
+
+| # | 改动 | 文件 | 说明 |
+|---|------|------|------|
+| 1 | `RERANKER_MODEL_NAME` 改为本地已缓存模型 | [.env](.env) | `BAAI/bge-reranker-v2-m3` → `BAAI/bge-reranker-base`。当前「本地 CrossEncoder 优先」策略下，v2-m3 本机未缓存，首次问答会触发约 2GB 联网下载；base 已有完整快照，可直接离线加载 |
+| 2 | 开启 HuggingFace 离线模式 | [.env](.env) | 新增 `HF_HUB_OFFLINE=1`，强制只用本地缓存、禁止联网下载。缓存缺失时本地加载秒失败并自动降级到云端 `/rerank` API，链路不中断 |
+| 3 | 模板同步说明 | [.env.example](.env.example) | 补充重排降级链说明与 `HF_HUB_OFFLINE` 注释（默认注释掉，避免影响未缓存模型的新环境） |
+| 4 | `rerank_documents` 模型名默认值改为读 config | [utils/reranker_helper.py](utils/reranker_helper.py) | 形参 `model_name` 由硬编码 `"BAAI/bge-reranker-v2-m3"` 改为 `Optional[str] = None`，函数内在运行时解析为 `config.RERANKER_MODEL_NAME`。此前绕过 `main.py` 直接调用该函数（自写脚本 / Notebook）会落到硬编码的 v2-m3，与 `.env` 配置不一致并触发下载 |
+
+### 验证情况
+
+- ✅ `config.RERANKER_MODEL_NAME` / `HF_HUB_OFFLINE` 从 `.env` 正确读取
+- ✅ **离线加载成功**：`本地重排模型已加载并缓存: BAAI/bge-reranker-base`（`HF_HUB_OFFLINE=1` 下，无联网）
+- ✅ 重排打分正常：相关文档 **0.9928** / 无关文档 0.0000，`_local_model_failed` 为空（未走兜底）
+- ✅ 对比验证：同样配置下若模型名仍为 `v2-m3`，本地加载失败 → 自动降级硅基流动 `/rerank` API 并成功返回（证明兜底链完好，API key 有效）
+- ✅ 默认值修复验证：不传 `model_name` 直接调用 `rerank_documents()`，实际使用 `BAAI/bge-reranker-base` 并走本地路径
+- ✅ 端到端冒烟测试通过（`=== ALL API ENDPOINTS PASSED ===`），LLM 接入点为 `https://api.siliconflow.cn/v1`，重排走本地 `bge-reranker-base`（score 0.9998）
+
+### 说明
+
+- `.env` 中的 `LLM_API_BASE=https://api.xiaomimimo.com/v1` **保持原样未改动**，也**未被任何代码读取**（LLM / Embedding / Rerank 统一读 `OPENAI_API_BASE`），属无效配置项，对运行无影响。
+  - 曾试验性地为它增加"LLM 专用接入点"支持（config.py + main.py），确认用户不需要切换至该平台后已**完全回退**，`config.py` / `main.py` 恢复原状。
+
+## 2026-09-13 — 冒烟测试脚本修复与全链路冒烟验证
+
+### 修复内容
+
+| # | 改动 | 文件 | 说明 |
+|---|------|------|------|
+| 1 | 冒烟脚本改用上下文管理器 | [smoke_api_test.py](smoke_api_test.py) | 由裸 `client = TestClient(api.app)` 改为 `with TestClient(api.app) as client:`。Starlette 1.6 / FastAPI 0.141 只在进入 ASGI lifespan 协议时才执行 `startup` 事件，裸实例化不触发 → `init_db()` 未执行 → 第二个接口即报 `sqlite3.OperationalError: no such table: sessions`。脚本已加注释说明该约束 |
+| 2 | 脚本增加测试数据清理 | [smoke_api_test.py](smoke_api_test.py) | 末尾删除本次上传的文档与会话，避免在开发库留下 `sample.txt` 与 `smoke test` 会话 |
+
+### 验证情况
+
+- ✅ **真实 uvicorn 服务端到端冒烟：22/22 项通过**（临时库，`RERANKER_MODEL_NAME=BAAI/bge-reranker-base` + `HF_HUB_OFFLINE=1`）
+  - 接口：health、会话增删查、历史（含 assistant meta）、txt/md 上传、文档列表、问答、文档删除
+  - 边界：不存在会话问答 404、不存在文档/会话删除 404、不存在会话历史 404、非法后缀 400
+  - 链路：multi-query 生成 3 条子查询 → BM25 索引构建 → 混合检索 RRF 融合 → **本地 CrossEncoder 重排**（打分 0.9911 vs 0.0）→ 生成 → 幻觉校验 → 置信度 0.95/1.0
+- ✅ 修复后的 `smoke_api_test.py` 独立跑通（TestClient 路径），日志可见完整链路
+- ✅ 本地重排模型 `BAAI/bge-reranker-base` 离线可用（快照 1060MB；快照路径加载 12.7s，模型名加载 2.7s，相关文档 0.9997 / 无关文档 0.0），确认可替代默认的 `bge-reranker-v2-m3`
+- ✅ 临时脚本与临时库已全部清理
+
+### 遗留问题（本次发现，未修）
+
+- 上传文档的 `source` 元数据是**服务端临时文件名**（形如 `tmp\48aebf8e_sample.txt`），前端「来源」面板会把随机前缀暴露给用户；应在入库时改写为原始文件名。当前两级删除仍可命中（`source` 包含原文件名），故未影响功能。
+
+### 建议提交信息
+
+```
+fix(smoke): enter TestClient context manager to trigger lifespan startup
+
+- starlette 1.x only runs startup events inside ASGI lifespan; bare TestClient left
+  sqlite tables uninitialized and the 2nd request failed with "no such table: sessions"
+- clean up uploaded doc/session at the end of the smoke run
+```
+
+---
+
 ## 2026-09-13 — 重排降级链顺序调整（本地优先）
 
 | # | 改动 | 文件 | 说明 |

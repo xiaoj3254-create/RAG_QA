@@ -71,7 +71,7 @@ def rerank_documents(
     query: str,
     docs: List[Document],
     top_n: int,
-    model_name: str = "BAAI/bge-reranker-v2-m3",
+    model_name: Optional[str] = None,
 ) -> List[Document]:
     """对检索结果重排序，返回前 top_n 个文档。
 
@@ -86,12 +86,17 @@ def rerank_documents(
         docs: 召回阶段的文档列表。
         top_n: 重排后返回的数量。
         model_name: 重排模型名（本地模型名，同时作为 API 候选模型名）。
+            留空则取 config.RERANKER_MODEL_NAME（即 .env 配置），**不硬编码默认模型**，
+            避免绕过调用方时与 .env 配置不一致。
 
     Returns:
         重排后的文档列表；全部失败时降级返回 docs[:top_n]。
     """
     if not docs:
         return docs
+
+    # 运行时解析（而非形参默认值）：确保读到的始终是当前 config 值
+    model_name = model_name or config.RERANKER_MODEL_NAME
 
     ranked = _rerank_local(query, docs, top_n, model_name)
     if ranked is not None:

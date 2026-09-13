@@ -43,7 +43,7 @@ MULTI_QUERY_NUM = int(os.getenv("MULTI_QUERY_NUM", "3"))                      # 
 # ----------------------------------------------------------------------
 # API 密钥与接入点
 # ----------------------------------------------------------------------
-# LLM / Embedding 统一走 OpenAI 兼容协议（默认硅基流动 SiliconFlow）；
+# LLM / Embedding / Rerank 统一走 OpenAI 兼容协议（默认硅基流动 SiliconFlow）；
 # 换其他平台只需改 OPENAI_API_BASE 与对应模型名。
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.siliconflow.cn/v1")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")

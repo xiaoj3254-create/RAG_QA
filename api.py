@@ -1,16 +1,26 @@
-"""FastAPI 后端服务层：串起 RAG 核心 + SQLite 元数据存储 + 文档上传。
+"""FastAPI 后端服务层：串联 RAG 核心 + SQLite 元数据存储 + 文档上传。
 
-- /api/doc/*：文档上传与列表
-- /api/chat：问答（保存会话消息）
-- /api/session/*：会话管理
-- /health：前端连通性探测
-- /docs：FastAPI 自动生成的接口文档
+接口清单：
+- /api/doc/upload（POST）      文档上传：解析 → 分块 → 写入 Chroma → 记录元数据
+- /api/doc/list（GET）         已上传文档列表
+- /api/doc/{doc_id}（DELETE）  删除文档（同步清理 Chroma 向量与 SQLite 元数据）
+- /api/chat（POST）            问答：调用 RAGChain.query 并持久化会话消息
+- /api/session（GET/POST）     会话列表 / 新建会话
+- /api/session/{id}/history（GET）    会话历史消息
+- /api/session/{id}（DELETE）  删除会话及其全部消息
+- /health                      前端连通性探测
+- /docs                        FastAPI 自动生成的接口文档
 
-设计要点：全局单例 RAGChain（避免 Chroma/LLM 重复实例化）；
-前端参数通过 chat 请求体临时覆盖（不污染全局配置）。
+设计要点：
+- RAGChain 全局单例（双检锁构造），避免 Chroma/LLM 重复实例化；
+- 前端运行参数（chunk/top_k/开关）通过 chat 请求体临时覆盖：
+  互斥锁保护"覆盖+查询"全程，finally 中快照恢复，并发请求互不污染；
+- 文档增删与问答共用同一把锁，保证单例状态变更（retriever 重关联、建图）
+  不会与进行中的查询竞争。
 """
 import os
 import threading
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -96,7 +106,7 @@ def health():
 # ----------------------------------------------------------------------
 @app.post("/api/doc/upload")
 async def upload_doc(file: UploadFile = File(...)):
-    """上传并解析文档（txt/md/pdf），写入 Chroma 并记录元数据到 SQLite。"""
+    """上传并解析文档（txt/md/pdf/json/csv），写入 Chroma 并记录元数据到 SQLite。"""
     # filename 可能为空（某些客户端不携带），兜底占位名
     filename = file.filename or "unnamed"
     # 大小限制校验
@@ -105,10 +115,10 @@ async def upload_doc(file: UploadFile = File(...)):
     if len(content) > max_bytes:
         raise HTTPException(413, f"文件超过 {config.MAX_UPLOAD_MB}MB 限制")
 
-    # 后缀校验
+    # 后缀校验（与 utils/file_loader.py 的 SUPPORTED_EXTS 保持一致）
     suffix = Path(filename).suffix.lower()
-    if suffix not in {".txt", ".md", ".pdf"}:
-        raise HTTPException(400, "仅支持 txt/md/pdf 文件")
+    if suffix not in {".txt", ".md", ".pdf", ".json", ".csv"}:
+        raise HTTPException(400, "仅支持 txt/md/pdf/json/csv 文件")
 
     # 写临时文件后走 file_loader 解析（复用 PDF/编码兜底逻辑）
     # tmp 目录固定在项目根下，避免按 CHROMA_DB_PATH 推断依赖进程 CWD 而分叉
@@ -128,21 +138,50 @@ async def upload_doc(file: UploadFile = File(...)):
     # 分块 + 追加到 Chroma；retriever 重关联与建图是单例状态变更，
     # 与 chat 的配置覆盖/恢复共用锁，避免并发竞态
     rag = get_rag()
+    # 预生成 doc_id，注入每个 chunk 的 metadata，建立「SQLite 文档 ↔ Chroma 向量」关联，
+    # 后续删除文档时可按 doc_id 精准定位并删除对应向量。
+    doc_id = uuid.uuid4().hex
     with _config_lock:
-        chunks = rag.processor.split_documents(docs)
-        rag.processor.create_vector_store(chunks)
-        rag.retriever = Retriever(rag.processor.vector_store, rag.config)
+        # process() 统一入口：内部完成 doc_id 注入 → 分块 → 追加向量化
+        chunk_count = rag.processor.process(docs, doc_id=doc_id)
+        rag.retriever = Retriever(rag.processor.vector_store, rag.config,
+                                  bm25=rag.processor.bm25)
         rag._build_graph()
 
     # 记录元数据到 SQLite
-    doc_id = sqlite_db.add_uploaded_doc_meta(filename, len(chunks))
-    return {"doc_id": doc_id, "file_name": filename, "chunk_count": len(chunks)}
+    sqlite_db.add_uploaded_doc_meta(filename, chunk_count, doc_id=doc_id)
+    return {"doc_id": doc_id, "file_name": filename, "chunk_count": chunk_count}
 
 
 @app.get("/api/doc/list")
 def list_docs():
     """获取已上传文档元数据列表。"""
     return {"docs": sqlite_db.list_uploaded_docs()}
+
+
+@app.delete("/api/doc/{doc_id}")
+def delete_doc(doc_id: str):
+    """删除已上传文档：同时清理 Chroma 向量与 SQLite 元数据。
+
+    先删 Chroma 向量（按 doc_id 过滤），再删 SQLite 记录；
+    若 Chroma 删除失败仍继续删元数据，避免残留死记录。
+    """
+    doc = sqlite_db.get_uploaded_doc(doc_id)
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+
+    rag = get_rag()
+    # 向量与元数据分两步，互不阻塞：即使 Chroma 删除异常，元数据也要清掉
+    # 传入 file_name 作为 source 兜底匹配，兼容早期未注入 doc_id 的历史 chunk
+    with _config_lock:
+        deleted_chunks = rag.processor.delete_documents_by_doc_id(doc_id, source=doc["file_name"])
+    sqlite_db.delete_uploaded_doc(doc_id)
+    logger.info("删除文档: %s (chunks_removed=%d)", doc["file_name"], deleted_chunks)
+    return {
+        "doc_id": doc_id,
+        "file_name": doc["file_name"],
+        "deleted_chunks": deleted_chunks,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -154,6 +193,9 @@ def chat(req: ChatRequest):
 
     运行参数（chunk/top_k/开关）是进程内单例的临时覆盖：互斥锁保护覆盖+查询全程，
     保证并发请求不互相污染；finally 里快照恢复，避免一个会话的参数泄漏给下一个会话。
+
+    注意：chunk_size/chunk_overlap 只影响"之后上传的文档"如何分块（重建 splitter），
+    不会重新切分已入库的向量数据；top_k 与功能开关则对本次查询即时生效。
     """
     rag = get_rag()
 
@@ -251,3 +293,12 @@ def session_history(session_id: str):
     if not msgs and not any(s["session_id"] == session_id for s in sqlite_db.get_all_sessions()):
         raise HTTPException(404, "会话不存在")
     return {"session_id": session_id, "messages": msgs}
+
+
+@app.delete("/api/session/{session_id}")
+def delete_session(session_id: str):
+    """删除会话及其全部历史消息。"""
+    deleted = sqlite_db.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(404, "会话不存在")
+    return {"session_id": session_id, "deleted": True}

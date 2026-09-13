@@ -1,20 +1,22 @@
 """
-RAG 检索增强生成系统 - 完整实现（秋招升级版）
+RAG 检索增强生成系统 - 核心模块
 
-本模块实现了生产级别的 RAG 系统，包括：
-- 文档加载和处理（支持 Chroma 磁盘持久化）
-- 向量存储和检索（Multi-Query 多路召回 + Cross-Encoder 重排）
-- 上下文感知的问答生成（幻觉自检 + LangGraph 条件分支重试）
-- 来源引用和置信度评估
+覆盖完整 RAG 链路的四大能力：
+1. 文档处理（DocumentProcessor）：加载、分块、向量化，Chroma 磁盘持久化；
+   支持 doc_id 注入与两级匹配删除，启动时自动检测 Embedding 维度兼容性；
+2. 混合检索（Retriever）：向量稠密 + BM25 稀疏双路召回，RRF 融合；
+   支持 Multi-Query 多路召回，被多路命中的 chunk 排名自然靠前；
+   检索后由 Cross-Encoder 重排精排（本地模型优先，云端 API 兜底）；
+3. 生成（Generator）：查询改写、上下文问答、置信度评估、幻觉检测；
+4. 流程编排（RAGChain）：LangGraph 7 节点状态图 + 幻觉自检条件边，
+   检测到幻觉时带纠偏 feedback 跳回重生成，max_retry 上限防死循环。
 
-⚠️ Embeddings 说明：
-- 默认使用简单的 Fake Embeddings（用于演示）
-- 如需高质量结果，请设置 OPENAI_API_KEY 使用 OpenAI Embeddings
-- 使用 SimpleEmbeddings 时程序会打印警告，生产环境必须配置真实 Embedding
-
-⚠️ LLM 说明：
-- 优先使用 Groq（llama-3.3-70b）：未配置密钥时自动进入演示降级模式
-- 降级模式下仍可跑通检索、来源、子查询、重排、幻觉校验全流程
+⚠️ LLM / Embedding 接入说明：
+- 统一走 OpenAI 兼容协议（默认硅基流动 SiliconFlow），
+  生成模型 deepseek-ai/DeepSeek-V4-Flash，向量模型 BAAI/bge-m3；
+- 未配置密钥时自动进入演示降级模式：Embedding 退化为 SimpleEmbeddings
+  （MD5 哈希伪向量，仅演示用，启动时打印生产警告），生成退化为固定文案，
+  但检索、来源、子查询、重排、幻觉校验全流程仍可跑通。
 """
 
 import re
@@ -30,7 +32,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.embeddings import Embeddings
 
 # 文本处理
@@ -44,7 +45,7 @@ from langgraph.graph import StateGraph, START, END
 
 # 项目内部模块
 from utils.logger import setup_logger
-from utils import file_loader, reranker_helper
+from utils import file_loader, reranker_helper, bm25_helper
 
 logger = setup_logger("rag", config.LOG_FILE)
 
@@ -52,12 +53,12 @@ logger = setup_logger("rag", config.LOG_FILE)
 load_dotenv()
 
 
-# 初始化 Groq 模型（懒加载单例：生成/改写/多查询/幻觉检测共用同一实例）
+# 初始化生成模型（懒加载单例：生成/改写/多查询/幻觉检测共用同一实例）
 _model: Any = None
 
 
 def deepseek_model():
-    """懒加载 Groq LLM 单例；无有效密钥时抛出 ValueError。"""
+    """懒加载生成 LLM 单例；无有效密钥时抛出 ValueError。"""
     global _model
     if _model is None:
         if not config.DEEPSEEK_API_KEY or config.DEEPSEEK_API_KEY.startswith("your_"):
@@ -76,7 +77,7 @@ class SimpleEmbeddings(Embeddings):
     简单的 Embeddings 实现（用于演示）
 
     使用简单的文本哈希生成确定性伪随机向量，适合演示目的。
-    生产环境请使用 OpenAI 或 HuggingFace Embeddings。
+    生产环境请通过硅基流动（OpenAI 兼容协议）或 HuggingFace 使用真实语义 Embedding。
     """
 
     def __init__(self, dimension: int = 384):
@@ -115,7 +116,7 @@ def get_embeddings():
     if config.OPENAI_API_KEY and not config.OPENAI_API_KEY.startswith("your_"):
         try:
             from langchain_openai import OpenAIEmbeddings
-            logger.info("使用 OpenAI Embeddings: %s（base: %s）",
+            logger.info("使用硅基流动 Embeddings（OpenAI 兼容协议）: %s（base: %s）",
                         config.OPENAI_EMBEDDING_MODEL, config.OPENAI_API_BASE)
             # timeout=30：embed_documents 批量嵌入可能较慢，10s 不够
             return OpenAIEmbeddings(
@@ -123,6 +124,10 @@ def get_embeddings():
                 base_url=config.OPENAI_API_BASE,
                 api_key=config.OPENAI_API_KEY,
                 timeout=30,
+                # 硅基流动等非 OpenAI 厂商不接受 langchain 默认的 tokenize 分片后
+                # 提交的 token 整数数组（会 400 The parameter is invalid）。
+                # 关闭后直接提交原始文本字符串，兼容多路接入。
+                check_embedding_ctx_length=False,
             )
         except ImportError:
             logger.warning("langchain_openai 未安装，使用简单 Embeddings")
@@ -164,6 +169,11 @@ class RAGConfig:
     multi_query_num: int = config.MULTI_QUERY_NUM
     reranker_model_name: str = config.RERANKER_MODEL_NAME
 
+    # 混合检索（BM25 稀疏 + 向量稠密，RRF 融合）
+    enable_hybrid_search: bool = config.ENABLE_HYBRID_SEARCH
+    bm25_candidate_k: int = config.BM25_CANDIDATE_K
+    rrf_k: int = config.RRF_K
+
 
 # ==================== 状态定义 ====================
 
@@ -176,7 +186,7 @@ class RAGState(TypedDict):
     answer: str                         # 生成的回答
     sources: List[Dict[str, Any]]       # 来源信息
     confidence: float                   # 置信度评分
-    # ---- 新增字段 ----
+    # ---- 检索增强与自检字段 ----
     sub_queries: List[str]              # multi-query 生成的子查询
     rerank_scores: List[Dict[str, Any]] # 重排打分明细（供调试面板）
     is_hallucination: bool              # 幻觉校验结果
@@ -200,6 +210,9 @@ class DocumentProcessor:
         self.embeddings = get_embeddings()  # 使用智能选择的 Embeddings
         self.vector_store = None
         self._create_vector_store()  # 启动即创建/加载一次，避免重复实例化
+        # BM25 稀疏检索索引（与向量库同一份语料；归 DocumentProcessor 持有，
+        # 因为增删文档后由此负责失效标记；Retriever 只读检索）
+        self.bm25 = bm25_helper.BM25Helper(self.vector_store)
 
     def _create_vector_store(self) -> None:
         """创建 Chroma 持久化向量库（加载已有数据，不重建）；失败回退内存向量库。"""
@@ -222,7 +235,7 @@ class DocumentProcessor:
         """检测已持久化向量维度与当前 Embedding 是否一致。
 
         常见踩坑：先用 SimpleEmbeddings(384 维) 写入 Chroma，之后配置 OPENAI_API_KEY
-        重启后改用 OpenAIEmbeddings(1536 维)。维度不一致会导致每次检索都报错，
+        重启后改用硅基流动 BAAI/bge-m3(1024 维)。维度不一致会导致每次检索都报错，
         而检索节点会静默吞掉异常返回空结果——表现为"什么都搜不到"，极难排查。
         这里显式检测并在日志中大声警告；同时清空该 collection，让新上传的文档
         以新维度重建索引（向量只是派生数据，源文档仍在，重新上传即可恢复）。
@@ -245,7 +258,7 @@ class DocumentProcessor:
 
             logger.error(
                 "⚠️ Embedding 维度不兼容：库中已有的向量维度为 %d，当前 Embedding 生成 %d 维。"
-                "这是简单Embedding与OpenAI Embedding切换导致的。仅删除向量无法生效，"
+                "这是 SimpleEmbeddings 与硅基流动 BAAI/bge-m3 切换导致的。仅删除向量无法生效，"
                 "因为 collection 的 HNSW 维度元数据仍停留在旧维度；这里直接删除并重建 collection，"
                 "请重新上传文档以新维度建立索引。",
                 stored_dim, current_dim,
@@ -298,55 +311,142 @@ class DocumentProcessor:
             self.vector_store.add_documents(documents)
         return self.vector_store
 
-    def process(self, texts: List[str], metadatas: Optional[List[Dict]] = None):
-        """完整处理流程：加载 -> 分块 -> 追加向量化"""
-        logger.info("加载文档...")
-        documents = self.load_documents(texts, metadatas)
-        logger.info("加载了 %d 个文档", len(documents))
+    def delete_documents_by_doc_id(self, doc_id: str, source: Optional[str] = None) -> int:
+        """从 Chroma 中删除指定文档的所有 chunk，返回删除数量。
+
+        删除策略（两级匹配，兼容历史数据）：
+        1. 优先按 doc_id 精确匹配（新上传的文档在入库时已注入 doc_id）；
+        2. 若按 doc_id 未命中，且提供了 source（文件名），则按 source 包含文件名兜底匹配
+           （兼容早期上传、未注入 doc_id 的历史 chunk）。
+        """
+        store = getattr(self.vector_store, "_collection", None)
+        if store is None:
+            logger.warning("向量库无 _collection（可能是内存兜底），跳过删除")
+            return 0
+        try:
+            # 第一级：按 doc_id 精确匹配
+            result = store.get(where={"doc_id": doc_id}, include=[])
+            ids = result.get("ids", []) or []
+
+            # 第二级：doc_id 未命中时，按 source 兜底匹配（兼容历史数据）
+            # 注意：chromadb 的 $contains 仅用于列表字段，不支持字符串子串匹配，
+            # 因此拉取全部 metadata 在 Python 端做子串过滤。
+            if not ids and source:
+                all_data = store.get(include=["metadatas"])
+                ids = [
+                    cid for cid, meta in zip(all_data["ids"], all_data["metadatas"])
+                    if meta and source in (meta.get("source") or "")
+                ]
+                if ids:
+                    logger.info("doc_id=%s 无匹配，改用 source 兜底匹配到 %d 个 chunk", doc_id, len(ids))
+
+            if ids:
+                store.delete(ids=ids)
+                logger.info("已从 Chroma 删除 doc_id=%s 的 %d 个 chunk", doc_id, len(ids))
+                self.bm25.invalidate()  # 语料已变更，BM25 索引待重建
+            return len(ids)
+        except Exception as e:
+            logger.warning("Chroma 删除失败 doc_id=%s: %s", doc_id, e)
+            return 0
+
+    def process(self, documents: List[Document], doc_id: Optional[str] = None) -> int:
+        """Document 入库统一入口：注入 doc_id → 分块 → 追加向量化，返回 chunk 数。
+
+        若传入 doc_id，会注入每个 Document 的 metadata，建立 SQLite 文档 ↔ Chroma 向量关联。
+        api.py 上传流程与 index_documents 纯文本分支均通过此入口入库。
+        """
+        if doc_id:
+            for doc in documents:
+                doc.metadata["doc_id"] = doc_id
 
         logger.info("分割文档...")
         chunks = self.split_documents(documents)
         logger.info("生成了 %d 个文本块", len(chunks))
 
         logger.info("写入向量存储...")
-        vector_store = self.create_vector_store(chunks)
+        self.create_vector_store(chunks)
         logger.info("向量存储更新完成")
-        return vector_store
+        self.bm25.invalidate()  # 语料已变更，BM25 索引待重建
+        return len(chunks)
 
-    def process_paths(self, paths: List[str]) -> int:
-        """文件路径入口：解析文件 -> 分块 -> 追加向量化，返回 chunk 数。"""
+    def process_paths(self, paths: List[str], doc_id: Optional[str] = None) -> int:
+        """文件路径入口：解析文件 -> 分块 -> 追加向量化，返回 chunk 数。
+
+        解析后复用 process() 统一入库（支持 doc_id 注入）。
+        """
         docs = file_loader.load_files(paths)
         if not docs:
             logger.warning("没有成功解析到任何文件")
             return 0
-        chunks = self.split_documents(docs)
-        self.create_vector_store(chunks)
-        logger.info("已索引 %d 个文件，共 %d 个文本块", len(docs), len(chunks))
-        return len(chunks)
+        return self.process(docs, doc_id=doc_id)
 
 
 # ==================== 检索模块 ====================
 
 class Retriever:
-    """检索器：从向量存储中检索相关文档（支持单路与多路召回）"""
+    """检索器：向量稠密检索 + BM25 稀疏检索，RRF 融合（可降级为纯向量）"""
 
-    def __init__(self, vector_store, config: RAGConfig):
+    def __init__(self, vector_store, config: RAGConfig, bm25: Optional[bm25_helper.BM25Helper] = None):
         self.vector_store = vector_store
         self.config = config
+        # BM25 索引由 DocumentProcessor 持有并随增删失效；未传入时自建（独立使用场景）
+        self.bm25 = bm25 or bm25_helper.BM25Helper(vector_store)
+
+    def _vector_search(self, query: str, k: int) -> List[Document]:
+        """向量单路检索（异常返回空列表，不中断融合）"""
+        try:
+            return self.vector_store.similarity_search(query=query, k=k)
+        except Exception as e:
+            logger.warning("向量检索失败 q=%s: %s", query, e)
+            return []
+
+    def _hybrid_search(self, query: str) -> List[List[Document]]:
+        """对单条查询执行 向量 + BM25 双路召回，返回结果列表（供 RRF 融合）"""
+        lists = [self._vector_search(query, self.config.top_k)]
+        bm25_docs = self.bm25.search(query, k=self.config.bm25_candidate_k)
+        if bm25_docs:
+            lists.append(bm25_docs)
+        return lists
 
     def retrieve(self, query: str) -> List[Document]:
-        """单路检索"""
-        return self.vector_store.similarity_search(
-            query=query,
-            k=self.config.top_k
+        """单路检索（混合开关开启时为向量+BM25 双路 RRF 融合）"""
+        if not self.config.enable_hybrid_search:
+            return self._vector_search(query, self.config.top_k)
+
+        lists = self._hybrid_search(query)
+        if len(lists) <= 1:
+            return lists[0] if lists else []
+        fused = bm25_helper.rrf_fuse(
+            lists, rrf_k=self.config.rrf_k, top_n=self.config.top_k * 2
         )
+        logger.info("混合检索（单路）：%d 路融合 → %d 个候选", len(lists), len(fused))
+        return fused
 
     def retrieve_multi(self, queries: List[str]) -> List[Document]:
-        """多查询召回：逐条检索，按内容去重合并（适度扩容候选供重排筛选）"""
+        """多查询召回。
+
+        混合模式：每个子查询做 向量+BM25 双路召回，所有结果统一 RRF 融合——
+        被多个子查询/多路同时命中的 chunk 排名自然靠前（跨查询共识）。
+        纯向量模式：保留原有逐条检索、按内容去重合并逻辑。
+        """
+        if self.config.enable_hybrid_search:
+            all_lists: List[List[Document]] = []
+            for q in queries:
+                all_lists.extend(self._hybrid_search(q))
+            if not all_lists:
+                return []
+            fused = bm25_helper.rrf_fuse(
+                all_lists, rrf_k=self.config.rrf_k, top_n=self.config.top_k * 3
+            )
+            logger.info("混合检索（多路）：%d 个子查询 × 2 路 = %d 路结果，RRF 融合 → %d 个候选",
+                        len(queries), len(all_lists), len(fused))
+            return fused
+
+        # 纯向量多路召回（原逻辑）
         seen = set()
         merged: List[Document] = []
         for q in queries:
-            for doc in self.vector_store.similarity_search(query=q, k=self.config.top_k):
+            for doc in self._vector_search(q, self.config.top_k):
                 if doc.page_content not in seen:
                     seen.add(doc.page_content)
                     merged.append(doc)
@@ -355,19 +455,6 @@ class Retriever:
                 break
         return merged
 
-    def retrieve_with_scores(self, query: str) -> List[tuple]:
-        """检索文档并返回相似度分数"""
-        return self.vector_store.similarity_search_with_score(  # 返回 `List[ (Document, score) ]` **元组列表**
-            query=query,
-            k=self.config.top_k
-        )
-
-            ## 小坑点
-            # 1. `retrieve_multi` 的去重是**精确文本匹配**，文本差一个字符就判定为不同文档，无法做模糊去重。
-            # 2. `similarity_search_with_score` 返回的 score，Chroma 是**距离值，不是相似度 (0~1)**，不要直接当做相似度概率判断。
-            # 3. 提前 break 是跳出外层`for q in queries`循环，不再处理剩下的子查询，减少向量库请求。
-
-
 # ==================== 生成模块 ====================
 
 class Generator:
@@ -375,7 +462,7 @@ class Generator:
 
     def __init__(self, config: RAGConfig):
         self.config = config
-        self.llm: Any = None  # 懒加载 Groq 模型，无密钥时保持 None 进入降级模式
+        self.llm: Any = None  # 懒加载生成模型，无密钥时保持 None 进入降级模式
 
         # RAG 提示模板
         self.rag_prompt = ChatPromptTemplate.from_messages([
@@ -416,7 +503,7 @@ class Generator:
         ])
 
     def _llm_available(self) -> bool:
-        """判断是否有可用的 Groq LLM（无密钥时进入降级模式）。"""
+        """判断是否有可用的生成 LLM（无密钥时进入降级模式）。"""
         return bool(config.DEEPSEEK_API_KEY) and not config.DEEPSEEK_API_KEY.startswith("your_")
 
     def _get_llm(self):
@@ -552,21 +639,29 @@ class RAGChain:
     def __init__(self, config: RAGConfig = None):
         self.config = config or RAGConfig()
         self.processor = DocumentProcessor(self.config)
-        self.retriever = Retriever(self.processor.vector_store, self.config)
+        self.retriever = Retriever(self.processor.vector_store, self.config,
+                                   bm25=self.processor.bm25)
         self.generator = Generator(self.config)
         self.graph = None
 
     def index_documents(self, texts: List[str], metadatas: Optional[List[Dict]] = None):
-        """索引文档（兼容文本列表；若传入的是文件路径列表则走 file_loader）"""
+        """索引文档（兼容文本列表；若传入的是文件路径列表则走 file_loader）
+
+        路径判定基于后缀：当所有元素都以 .txt/.md/.pdf/.json/.csv 结尾时视为文件路径列表，
+        因此不要传入"路径与纯文本混合"的列表——混合输入会被整体当作纯文本处理。
+        """
         if texts and all(isinstance(p, str) and (p.endswith((".txt", ".md", ".pdf", ".json", ".csv"))) for p in texts):
             # 视为文件路径列表
             chunk_count = self.processor.process_paths(texts)
             logger.info("已从文件索引 %d 个文本块", chunk_count)
         else:
-            self.processor.process(texts, metadatas)
+            # 纯文本列表：load_documents 转 Document 后走统一入库入口
+            documents = self.processor.load_documents(texts, metadatas)
+            self.processor.process(documents)
 
         # 重新关联 retriever 与最新的向量库（Chroma 模式下始终同一实例）
-        self.retriever = Retriever(self.processor.vector_store, self.config)
+        self.retriever = Retriever(self.processor.vector_store, self.config,
+                                   bm25=self.processor.bm25)
         self._build_graph()
 
     def _build_graph(self):
@@ -638,7 +733,7 @@ class RAGChain:
             return state
 
         def rerank_node(state: RAGState) -> RAGState:
-            """Reranker 节点：对检索结果做 Cross-Encoder 重排序（失败时保持原顺序）"""
+            """Reranker 节点：对检索结果重排序（本地 CrossEncoder 优先，云端 API 兜底，均失败保持原顺序）"""
             if self.config.enable_reranker and state.get("documents"):
                 try:
                     docs = reranker_helper.rerank_documents(
@@ -668,7 +763,7 @@ class RAGChain:
         def generate_answer(state: RAGState) -> RAGState:
             """生成回答（LLM 异常时返回友好提示，保证流程不中断）。
 
-            幻觉重试时传入 feedback，让 LLM 在相同 context 下换一种更难幻觉的方式作答。
+            幻觉重试时传入 feedback，让 LLM 在相同 context 下以更忠实于上下文的方式重新作答。
             """
             try:
                 state["answer"] = self.generator.generate(
@@ -772,7 +867,7 @@ class RAGChain:
             "answer": "",
             "sources": [],
             "confidence": 0.0,
-            # 新增字段
+            # 检索增强与自检字段
             "sub_queries": [],
             "rerank_scores": [],
             "is_hallucination": False,

@@ -1,1 +1,1 @@
-"""utils 工具包：文件解析、重排、日志。"""
+"""utils 工具包：文件解析（file_loader）、重排与多查询（reranker_helper）、BM25 混合检索（bm25_helper）、统一日志（logger）。"""

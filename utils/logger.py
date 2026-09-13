@@ -1,4 +1,10 @@
-"""统一日志工具：控制台输出 + 可选日志文件。"""
+"""统一日志工具：控制台输出 + 可选日志文件。
+
+- 各模块通过 setup_logger(name) 获取独立 logger，统一格式；
+- 重复调用返回已有实例，不会重复添加 handler 导致日志刷屏；
+- Windows 下自动将控制台重配置为 UTF-8，避免中文/emoji 日志编码炸栈；
+- 日志不向上传播到 root logger，避免与 uvicorn 等框架的日志重复输出。
+"""
 
 import logging
 import os

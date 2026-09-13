@@ -1,10 +1,13 @@
-# RAG 秋招完整项目依赖清单
+# RAG 项目依赖清单
 # 说明：版本使用主版本约束，安装时以 pip 实际可解析的稳定版为准。
 
 # ---- 基础 ----
 python-dotenv>=1.0
-PyPDF2>=3.0
+# PDF 解析依赖 pypdf（PyPDFLoader 底层实际使用；PyPDF2 已停更）
+pypdf>=4.0
 requests>=2.32
+# FastAPI UploadFile 解析 multipart 表单必需
+python-multipart>=0.0.9
 
 # ---- 后端 / 前端 ----
 fastapi>=0.100
@@ -17,12 +20,19 @@ langchain-core>=0.3
 langchain-community>=0.3
 langchain-text-splitters>=0.3
 langchain-openai>=0.2
-langchain-groq>=0.2
 langgraph>=0.2
+
+# ---- 文档解析（JSONLoader 顶层依赖 jq）----
+# jq 在 Windows 上安装可能需要编译环境；若仅用 txt/md/pdf 则可不装
+jq>=1.7
 
 # ---- 向量库 ----
 langchain-chroma>=0.1
 chromadb>=0.5
+
+# ---- 混合检索（BM25 稀疏检索 + jieba 中文分词）----
+rank-bm25>=0.2.2
+jieba>=0.42
 
 # ---- 重排（重型依赖，含 torch；安装失败时程序自动降级跳过重排）----
 sentence-transformers>=3.0

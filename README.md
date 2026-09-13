@@ -56,9 +56,9 @@ START → process_query → multi_query_node → retrieve → rerank_node → ge
 - **多格式解析**：`.pdf / .txt / .md / .json / .csv` 文档上传（pypdf 提取 PDF，编码按 utf-8 → gbk → latin-1 自动回退）
 - **文档管理**：上传自动分块入库并注入 `doc_id`；删除时同步清理 Chroma 向量与 SQLite 元数据
 - **混合检索（Hybrid Search）**：向量稠密检索 + BM25 稀疏检索（jieba 中文分词），RRF 融合——兼顾语义相关与关键词精确命中（如"第6条"这类编号查询）
-- **多轮对话 & 查询改写**：结合对话历史消除指代歧义，支持新建/切换/删除会话
+- **多轮对话 & 查询改写**：结合对话历史消除指代歧义，支持新建/切换/删除/命名会话
 - **Multi-Query 多路召回**：LLM 从多角度生成子查询，扩大召回覆盖
-- **重排**：对召回结果精打分重排，提升 top 相关性（本地 CrossEncoder 优先，云端 API 兜底）
+- **重排**：对召回结果精打分重排，提升 top 相关性（本地重排模型优先，云端重排接口兜底）
 - **幻觉自检重试**：条件分支重生成，降低幻觉回答
 - **来源引用 & 置信度打分**：回答附带来源文档片段与置信度
 - **调试面板**：展示改写后 Query、Multi-Query 子查询、Rerank 打分明细（JSON 树形）
@@ -76,13 +76,13 @@ copy .env.example .env # Windows
 
 关键配置项：
 ```ini
-# ---- 密钥与接入点（LLM/Embedding 统一走硅基流动 OpenAI 兼容协议）----
-DEEPSEEK_API_KEY=your_siliconflow_api_key_here   # 生成模型密钥
-OPENAI_API_KEY=your_siliconflow_api_key_here     # Embedding / rerank 密钥（通常同上）
-OPENAI_API_BASE=https://api.siliconflow.cn/v1    # 换平台改这里
-DEEPSEEK_MODEL=deepseek-ai/DeepSeek-V4-Flash     # 生成模型
-OPENAI_EMBEDDING_MODEL=BAAI/bge-m3               # Embedding 模型
-RERANKER_MODEL_NAME=BAAI/bge-reranker-v2-m3      # 重排模型
+# ---- 密钥与接入点（LLM / Embedding / 重排统一走 OpenAI 兼容协议）----
+DEEPSEEK_API_KEY=               # 对话模型密钥
+OPENAI_API_KEY=                 # 向量 / 重排密钥（通常同上）
+OPENAI_API_BASE=                # OpenAI 兼容接入点，换服务商改这里
+DEEPSEEK_MODEL=                 # 对话模型标识
+OPENAI_EMBEDDING_MODEL=         # 向量模型标识
+RERANKER_MODEL_NAME=            # 重排模型标识
 
 # ---- RAG 超参数 ----
 CHUNK_SIZE=500         # 分块大小
@@ -132,11 +132,11 @@ docker run -p 8000:8000 -p 8501:8501 --env-file .env \
 | 模块 | 职责 |
 |---|---|
 | `main.py` | **RAG 核心**：`DocumentProcessor`（Chroma 持久化、Embedding 维度兼容自检、`delete_documents_by_doc_id` 两级匹配删除）、`Retriever`（单路/多路召回、向量+BM25 混合检索 RRF 融合）、`Generator`（生成/改写/置信度/幻觉检测）、`RAGChain`（LangGraph 7 节点条件边图）、`RAGState(TypedDict)` |
-| `config.py` | 全局配置中心：读取 `.env`，集中管理路径、超参、模型名、功能开关 |
+| `config.py` | 全局配置中心：读取 `.env`，集中管理路径、超参、模型标识、功能开关 |
 | `api.py` | FastAPI 后端：`/api/doc/upload`、`/api/doc/list`、`/api/doc/{doc_id}`(DELETE)、`/api/chat`、`/api/session`(GET/POST)、`/api/session/{id}/history`、`/api/session/{id}`(DELETE)、`/health`；RAGChain 全局单例 + 互斥锁保护参数临时覆盖 |
 | `frontend.py` | Streamlit 前端（纯 HTTP 客户端，requests 调后端，零导入 RAG 内部类） |
 | `utils/file_loader.py` | 文件解析：PDF/TXT/MD/JSON/CSV → `Document`，编码回退与异常捕获 |
-| `utils/reranker_helper.py` | Multi-Query 生成 + 重排（本地 CrossEncoder 优先，硅基流动 /rerank API 兜底，再降级原顺序） |
+| `utils/reranker_helper.py` | Multi-Query 生成 + 重排（本地重排模型优先，云端重排接口兜底，再降级原顺序） |
 | `utils/bm25_helper.py` | BM25 稀疏检索（rank-bm25 + jieba 分词）与 RRF 多路融合；索引懒加载 + 脏标记重建 |
 | `utils/logger.py` | 统一日志（控制台 UTF-8 + 可选文件，防重复 handler） |
 | `db/sqlite_db.py` | SQLite 三表：`sessions`/`messages`/`uploaded_docs`（WAL 模式、外键、仅元数据不存向量） |
@@ -149,9 +149,10 @@ docker run -p 8000:8000 -p 8501:8501 --env-file .env \
 - 删除采用**两级匹配**：优先按 `doc_id` 精确删除；未命中（兼容早期未注入 doc_id 的历史数据）则按文件名兜底匹配 source 字段删除。
 - 向量删除后同步清理 SQLite 元数据，确保两侧一致。
 
-**会话删除（`DELETE /api/session/{session_id}`）**：
-- 先删除该会话全部消息，再删除会话本身（messages 表外键未声明 CASCADE，需显式清理）。
-- 前端删除后自动清空当前会话状态。
+**会话管理**：
+- 新建会话可自定义名称；留空则自动取默认名，并保证不与已有会话重名（重名自动补后缀）。
+- 删除会话时先删除该会话全部消息，再删除会话本身（messages 表外键未声明 CASCADE，需显式清理）；前端同步清空当前会话状态。
+- 切换会话时按会话标识重载历史消息，主区域始终显示当前会话名称与消息条数。
 
 ### 5.2 前端参数面板的生效范围
 
@@ -169,7 +170,7 @@ docker run -p 8000:8000 -p 8501:8501 --env-file .env \
 1. **查询改写（Query Rewrite）**：多轮对话中的"它""那个"等指代通过 LLM 改写为独立完整查询，提升检索命中率（`Generator.rewrite_query`）。
 2. **混合检索（Hybrid Search）**：纯向量检索对编号/关键词类查询不敏感，BM25 恰好补足字面精确匹配；两路结果经 RRF 融合（`bm25_helper.rrf_fuse`），被多路同时命中的 chunk 排名自然靠前。
 3. **Multi-Query 多路召回**：一个问题生成多个角度子查询，分别检索后融合去重，扩大召回覆盖（`reranker_helper.multi_query_generate`）。
-4. **重排（Reranker）**：召回（Bi-Encoder）追求速度和召回率但打分粗；重排对 query-doc 精打分，提升 top-K 相关性。**优先使用本地 CrossEncoder**（无网络依赖、无 API 配额与费用），本地模型不可用或推理失败时降级硅基流动 `/rerank` API（配置的模型名不可用时自动切换到平台可用的 `BAAI/bge-reranker-v2-m3`），两级都失败则保持召回原顺序（`reranker_helper.rerank_documents`）。
+4. **重排（Reranker）**：召回（Bi-Encoder）追求速度和召回率但打分粗；重排对 query-doc 精打分，提升 top-K 相关性。**优先使用本地重排模型**（无网络依赖、无接口配额与费用），本地模型不可用或推理失败时降级到云端重排接口，两级都失败则保持召回原顺序（`reranker_helper.rerank_documents`）。
 5. **幻觉自检条件分支**：生成后用 LLM 检测回答是否与上下文冲突；发现幻觉则通过 LangGraph 条件边带纠偏 feedback 跳回重生成，并有 `max_retry` 上限防死循环。
 
 ## 7. 调优参数
@@ -186,8 +187,8 @@ docker run -p 8000:8000 -p 8501:8501 --env-file .env \
 
 ## 8. 项目局限与未来改进
 
-- **Embedding 质量**：默认 SimpleEmbeddings（哈希伪向量）仅用于无密钥演示，生产必须配置真实语义向量（硅基流动 BAAI/bge-m3）。切换 Embedding 后系统会自动检测维度不兼容并重建 collection，需重新上传文档。
-- **重排模型**：重排优先使用本地 CrossEncoder，**首次调用会加载并缓存模型（含首次联网下载）**；如需完全离线部署，请预先下载模型到本地缓存。本地不可用时自动降级硅基流动 `/rerank` API（需配置 `OPENAI_API_KEY`）。
+- **向量质量**：默认使用哈希伪向量，仅用于无密钥演示，生产必须配置真实语义向量模型；切换向量模型后系统会自动检测维度不兼容并重建向量集合，需重新上传文档。
+- **重排模型**：重排优先使用本地模型，**首次调用会加载并缓存模型（若尚未缓存则需联网下载一次）**；如需完全离线部署，请预先下载模型到本地缓存。本地不可用时自动降级到云端重排接口（需配置 `OPENAI_API_KEY`）。
 - **安全**：当前接口无鉴权，仅适合本地/内网使用；生产需加认证、文件类型白名单校验、敏感词过滤、上下文注入防护。
 - **并发与性能**：RAGChain 为进程内单例，仅适配单 worker 部署；单次问答串行多次 LLM 调用，延迟偏高，可引入缓存与并行化。
 - **查询策略可扩展**：可加入 MMR（最大边际相关）去冗余、HyDE（假设文档）增强召回。

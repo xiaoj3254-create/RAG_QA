@@ -4,12 +4,15 @@
 
 页面结构：
 - 侧边栏：API 连通状态、文档上传/删除、RAG 参数面板、会话新建/切换/删除；
-- 主区域：对话气泡渲染；助手回答下方两个折叠面板——
+- 主区域：当前会话提示、对话气泡渲染；助手回答下方两个折叠面板——
   "来源与置信度"（来源片段 + 置信度分数）和"调试信息"
   （改写后 Query、Multi-Query 子查询、Rerank 打分明细）；底部聊天输入框。
 
 状态管理：会话历史从后端 SQLite 拉取（含助手消息的 meta 面板数据），
-切换会话时自动加载；删除会话后清空本地 session_state。
+切换会话时自动加载；删除会话后清空本地 session_state（含选择器 widget state）。
+
+会话命名：新建会话可自定义名称，默认名取「会话 N」（N 为现有同名会话最大编号 + 1），
+用户手填重名时自动补 `(2)`/`(3)` 后缀，从源头避免下拉框出现多个同名项。
 """
 import os
 
@@ -116,32 +119,73 @@ with st.sidebar:
 
     # 4. 会话列表
     st.subheader("💬 会话列表")
-    if st.button("新建会话"):
-        code, resp = api("POST", "/api/session", json={"session_name": "新会话"})
-        if code == 200:
-            st.session_state["session_id"] = resp["session_id"]
-            st.session_state["history"] = []
-            st.rerun()
+
+    # 先取会话列表：既用于渲染选择器，也用于生成不重名的默认会话名
     code, resp = api("GET", "/api/session")
     sessions = resp.get("sessions", [])
+    session_ids = [s["session_id"] for s in sessions]
+    session_names = {s["session_id"]: s["session_name"] for s in sessions}
+
+    # 默认名「会话 N」：N 取现有同名会话的最大编号 + 1，保证默认名不与已有会话重名
+    used_nums = [
+        int(n[3:]) for n in session_names.values()
+        if n.startswith("会话 ") and n[3:].isdigit()
+    ]
+    default_name = f"会话 {max(used_nums) + 1 if used_nums else 1}"
+
+    # 新建会话：名称可自定义。key 带版本号，创建成功后自增 → 输入框自动清空，
+    # 避免同一个名字被反复提交（否则新会话又会重名）。
+    name_gen = st.session_state.setdefault("name_gen", 0)
+    new_name = st.text_input(
+        "新会话名称", value="", placeholder=default_name,
+        key=f"new_session_name_{name_gen}",
+    )
+    if st.button("➕ 新建会话"):
+        name = (new_name or "").strip() or default_name
+        # 用户手填的名字若与已有会话相同，补 (2)/(3) 后缀，从源头避免重名
+        if name in session_names.values():
+            i = 2
+            while f"{name} ({i})" in session_names.values():
+                i += 1
+            name = f"{name} ({i})"
+
+        code, resp = api("POST", "/api/session", json={"session_name": name})
+        if code == 200:
+            sid = resp["session_id"]
+            # 必须同时写选择器的 widget state：否则它仍持有旧值，
+            # 下一轮会把 session_id 覆盖回旧会话，表现为「新建了但没切过去」
+            st.session_state["session_selector"] = sid
+            st.session_state["session_id"] = sid
+            st.session_state["loaded_sid"] = sid
+            st.session_state["history"] = []
+            st.session_state["name_gen"] = name_gen + 1
+            st.rerun()
+        else:
+            st.error(f"新建失败：{resp.get('detail', resp.get('error', code))}")
+
     if sessions:
+        # 选择器的 key 固定，保证选择结果跨 rerun 稳定保留；
+        # 若它持有的是已被删除的会话，Streamlit 会因「值不在选项内」报错，先归位到第一项
+        if st.session_state.get("session_selector") not in session_ids:
+            st.session_state["session_selector"] = session_ids[0]
+
         sel = st.selectbox(
             "选择会话",
-            [s["session_id"] for s in sessions],
-            format_func=lambda x: next(
-                (s["session_name"] for s in sessions if s["session_id"] == x), x
-            ),
+            session_ids,
+            format_func=lambda x: session_names.get(x, x),
+            key="session_selector",
         )
+        # 以选择器为准：切换后立即生效（主区按 session_id 变化重载历史）
         st.session_state["session_id"] = sel
+
         # 删除当前选中的会话
         if st.button("🗑️ 删除当前会话", key="del_session"):
             dc, dr = api("DELETE", f"/api/session/{sel}")
             if dc == 200:
                 st.success("会话已删除")
-                # 清空前端会话状态，避免继续引用已删除的 session_id
-                st.session_state.pop("session_id", None)
-                st.session_state.pop("history", None)
-                st.session_state.pop("loaded_sid", None)
+                # 清空前端会话状态（含选择器 widget state），避免继续引用已删除的 session_id
+                for k in ("session_id", "history", "loaded_sid", "session_selector"):
+                    st.session_state.pop(k, None)
                 st.rerun()
             else:
                 st.error(f"删除失败：{dr.get('detail', dr.get('error', dc))}")
@@ -161,6 +205,13 @@ sid = st.session_state.get("session_id")
 if sid and sid != st.session_state.get("loaded_sid"):
     st.session_state["history"] = load_history(sid)
     st.session_state["loaded_sid"] = sid
+
+# 显式展示当前会话：仅靠侧边栏选择器时，会话名相同就无法判断是否切换成功
+current_name = session_names.get(sid) if sid else None
+if current_name:
+    st.caption(f"当前会话：**{current_name}** · {len(st.session_state['history'])} 条消息")
+else:
+    st.caption("当前未选择会话，请在左侧新建或选择一个会话")
 
 # 渲染对话气泡
 for msg in st.session_state["history"]:

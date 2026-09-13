@@ -1,3 +1,9 @@
+"""文件解析工具：PDF / TXT / MD / JSON / CSV → LangChain Document 列表。
+
+- 单个文件解析失败返回 None，批量加载时自动跳过，不中断整体流程；
+- TXT/MD 按 utf-8 → gbk → latin-1 顺序回退解码；PDF 一页一个 Document；
+- 所有 Document 携带 source 元数据（由底层 Loader 生成）。
+"""
 import os
 from pathlib import Path
 from typing import List, Optional, Union
@@ -10,7 +16,7 @@ logger = setup_logger("file_loader", config.LOG_FILE)
 
 # 全项目统一支持的文件后缀（与 api.py 上传白名单保持一致）
 SUPPORTED_EXTS = {".txt", ".md", ".pdf", ".json", ".csv"}
-_ENCODINGS = ("utf-8", "gbk", "latin-1")  # 中文优先utf‑8，失败回退gbk
+_ENCODINGS = ("utf-8", "gbk", "latin-1")  # 中文优先 utf-8，失败回退 gbk
 
 
 def load_file(path: Union[str, Path]) -> Optional[List[Document]]:
@@ -72,7 +78,7 @@ def _read_file(path: Path) -> List[Document]:
                 continue
         # 全部编码失败兜底（latin-1 单字节映射永不抛解码异常）
         if last_err:
-            logger.warning("编码解析异常 %s，使用 latin‑1 兜底: %s", path.name, str(last_err))
+            logger.warning("编码解析异常 %s，使用 latin-1 兜底: %s", path.name, str(last_err))
             return [Document(page_content=path.read_text(encoding="latin-1"), metadata={"source": str(path)})]
 
     elif suffix == ".json":

@@ -1,1 +1,1 @@
-"""db 数据存储包：SQLite 元数据存储。"""
+"""db 数据存储包：SQLite 元数据存储（sqlite_db）；chroma_db/ 为向量库持久化目录。"""

@@ -1,5 +1,85 @@
 # Changelog
 
+## 2026-09-13 — 重排降级链顺序调整（本地优先）
+
+| # | 改动 | 文件 | 说明 |
+|---|------|------|------|
+| 1 | 重排降级链改为"本地优先" | [utils/reranker_helper.py](utils/reranker_helper.py) | `rerank_documents` 由「API 优先 → 本地兜底」改为 **① 本地 CrossEncoder → ② 硅基流动 `/rerank` API → ③ 原顺序**。`_rerank_local` 返回类型由 `List[Document]` 改为 `Optional[List[Document]]`：模型不可用或推理异常返回 `None` 交由上层降级，不再自行截断为 `docs[:top_n]`（否则会吞掉云端兜底机会） |
+| 2 | 本地模型加载失败结果缓存 | [utils/reranker_helper.py](utils/reranker_helper.py) | 新增 `_local_model_failed` 集合。本地成为首选路径后，若依赖缺失或模型下载失败，原实现会在每次问答都重试一次加载/下载并阻塞请求；现失败即记忆，后续请求直接走云端兜底（重启进程可重置，便于装好依赖后恢复本地优先） |
+| 3 | 同步注释与文档 | 多文件 | 模块 docstring、`main.py` 模块头与 `rerank_node` docstring、`README.md`（功能特性/模块表/优化策略/局限）、`项目分析文档.md`（技术栈表、目录树、函数解析、流程图、改进清单）统一改为本地优先表述 |
+
+### 验证情况
+
+- ✅ `py_compile` 语法检查通过（含 `main.py`、`reranker_helper.py`）
+- ✅ 三场景实测（venv，屏蔽真实 API key 禁止联网）：本地+云端均不可用 → 原顺序 `docs[:3]`；本地可用（注入假模型）→ 按本地分数倒序重排且 `rerank_score` 正确写回 metadata；本地推理抛异常 → 降级云端 → 原顺序
+- ✅ 临时验证脚本已删除
+
+### 建议提交信息
+
+```
+refactor(rerank): prefer local CrossEncoder, fall back to cloud /rerank API
+
+- swap fallback order in rerank_documents: local -> SiliconFlow API -> original order
+- _rerank_local returns Optional[List[Document]] so cloud fallback is reachable
+- cache failed local model loads to avoid retrying download on every request
+```
+
+---
+
+## 2026-09-13 — 移除法条编号归一化
+
+| # | 改动 | 文件 | 说明 |
+|---|------|------|------|
+| 1 | 删除法条编号归一化逻辑 | [utils/bm25_helper.py](utils/bm25_helper.py) | 移除 `_arabic_to_cn` / `_normalize_legal_numbers` / `_LEGAL_NUM_RE` / `_CN_DIGITS` 及 `import re`；`tokenize()` 恢复为直接 jieba 分词，不再做 `第6条`→`第六条` 转换。BM25 与向量双路 + RRF 融合检索本身不变 |
+
+### 验证情况
+
+- ✅ `py_compile` 语法检查通过
+- ✅ `tokenize('刑法第6条是什么')` → `['刑法', '第', '6', '条是', '什么']`，不再转换
+- ✅ 全项目无 `_normalize_legal_numbers` / `_arabic_to_cn` 残留引用
+
+### 建议提交信息
+
+```
+refactor: remove legal article number normalization from BM25 tokenizer
+
+- drop _arabic_to_cn/_normalize_legal_numbers and re import from utils/bm25_helper.py
+- tokenize() now uses plain jieba segmentation; hybrid retrieval pipeline unchanged
+```
+
+---
+
+## 2026-09-12 — BM25 混合检索代码审查修复（3 处，3 个文件）
+
+对"BM25 混合检索"改动做 code-review 发现的 3 个问题（2 名验证员独立确认，均为 minor），全部已修复。问题 1、2 的竞态在当前 FastAPI 单例 + `_config_lock` 全串行接线下不可达，属模块自身线程安全承诺未兑现的加固项；问题 3 无功能影响，属配置读取路径不一致。
+
+### 修复内容
+
+| # | 问题 | 文件 | 修复 |
+|---|------|------|------|
+| 1 | `BM25Helper.search()` 在锁释放后读 `_bm25`/`_docs`，而索引重建时先赋 `_bm25` 后赋 `_docs`——并发下可读到"新索引+旧文档"的错位组合（静默错误结果），或 `_bm25=None` 触发 AttributeError | [utils/bm25_helper.py](utils/bm25_helper.py) | `_ensure_index()` 改为返回锁内取得的 `(bm25, docs)` 快照；`search()` 锁外只用快照检索，快照内部严格按行对齐，invalidate/重建不再影响进行中的检索 |
+| 2 | `_get_local_reranker` 对模块级缓存 check-then-act 无锁，并发首调用会各自 `CrossEncoder()` 加载 GB 级模型，一份被丢弃，与"进程内只加载一次"的注释意图不符 | [utils/reranker_helper.py](utils/reranker_helper.py) | 新增 `_local_model_lock`，锁内二次检查缓存（双检锁），并发首调用只加载一次 |
+| 3 | `retrieve`/`retrieve_multi` 中 `rrf_k=config.RRF_K` 走模块级配置，相邻的 `bm25_candidate_k`/`top_k` 均走 `self.config`（RAGConfig），且 RAGConfig 缺 `rrf_k` 字段，参数无法按实例覆盖 | [main.py](main.py) | `RAGConfig` 新增 `rrf_k: int = config.RRF_K` 字段；两处 RRF 融合统一改走 `self.config.rrf_k` |
+
+### 验证情况
+
+- ✅ 三个改动文件 `ast` 语法检查通过
+- ✅ 冒烟测试（venv + 20 篇模拟语料）：法条编号归一化双端生效（`第6条`→`第六条` 命中原文）；invalidate 后旧快照检索仍返回对齐文档；失效后新检索自动重建；RRF 双路命中的文档排名第一
+- ⚠️ 小语料（N≤2）时 BM25Okapi 的 IDF 恒为 0（ln(1.5/1.5)）、所有得分被 >0 过滤属 rank-bm25 数学特性，非本次缺陷；真实库 150+ chunks 不受影响
+- ✅ 临时测试脚本已删除，向量库零测试残留
+
+### 建议提交信息
+
+```
+fix: hardening from BM25 hybrid search code review
+
+- snapshot (bm25, docs) under lock in BM25Helper to avoid index/doc skew
+- double-checked locking for local CrossEncoder singleton cache
+- add rrf_k field to RAGConfig; Retriever reads via self.config
+```
+
+---
+
 ## 2026-09-12 — BM25 混合检索（BM25 稀疏 + 向量稠密 + RRF 融合）
 
 背景：纯向量检索对"第6条"这类编号/关键词查询召回不准——语义相似度对数字编号无区分度。引入 BM25 稀疏检索补足字面精确匹配，两路结果经 RRF 融合，兼顾语义相关性与关键词命中。

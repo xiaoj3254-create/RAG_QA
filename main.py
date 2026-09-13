@@ -1,20 +1,22 @@
 """
-RAG 检索增强生成系统 - 完整实现
+RAG 检索增强生成系统 - 核心模块
 
-本模块实现了生产级别的 RAG 系统，包括：
-- 文档加载和处理（支持 Chroma 磁盘持久化）
-- 向量存储和检索（Multi-Query 多路召回 + 硅基流动 rerank 重排）
-- 上下文感知的问答生成（幻觉自检 + LangGraph 条件分支重试）
-- 来源引用和置信度评估
+覆盖完整 RAG 链路的四大能力：
+1. 文档处理（DocumentProcessor）：加载、分块、向量化，Chroma 磁盘持久化；
+   支持 doc_id 注入与两级匹配删除，启动时自动检测 Embedding 维度兼容性；
+2. 混合检索（Retriever）：向量稠密 + BM25 稀疏双路召回，RRF 融合；
+   支持 Multi-Query 多路召回，被多路命中的 chunk 排名自然靠前；
+   检索后由 Cross-Encoder 重排精排（本地模型优先，云端 API 兜底）；
+3. 生成（Generator）：查询改写、上下文问答、置信度评估、幻觉检测；
+4. 流程编排（RAGChain）：LangGraph 7 节点状态图 + 幻觉自检条件边，
+   检测到幻觉时带纠偏 feedback 跳回重生成，max_retry 上限防死循环。
 
-⚠️ Embeddings 说明：
-- 默认使用简单的 Fake Embeddings（用于演示）
-- 如需高质量结果，请在 .env 中配置 OPENAI_API_KEY（硅基流动密钥），通过 OpenAI 兼容协议调用硅基流动的 BAAI/bge-m3 向量模型
-- 使用 SimpleEmbeddings 时程序会打印警告，生产环境必须配置真实 Embedding
-
-⚠️ LLM / Embedding 说明：
-- 统一走 OpenAI 兼容协议接硅基流动（SiliconFlow），默认生成模型 deepseek-ai/DeepSeek-V4-Flash，向量模型 BAAI/bge-m3；
-  未配置密钥时自动进入演示降级模式，仍可跑通检索、来源、子查询、重排、幻觉校验全流程
+⚠️ LLM / Embedding 接入说明：
+- 统一走 OpenAI 兼容协议（默认硅基流动 SiliconFlow），
+  生成模型 deepseek-ai/DeepSeek-V4-Flash，向量模型 BAAI/bge-m3；
+- 未配置密钥时自动进入演示降级模式：Embedding 退化为 SimpleEmbeddings
+  （MD5 哈希伪向量，仅演示用，启动时打印生产警告），生成退化为固定文案，
+  但检索、来源、子查询、重排、幻觉校验全流程仍可跑通。
 """
 
 import re
@@ -170,6 +172,7 @@ class RAGConfig:
     # 混合检索（BM25 稀疏 + 向量稠密，RRF 融合）
     enable_hybrid_search: bool = config.ENABLE_HYBRID_SEARCH
     bm25_candidate_k: int = config.BM25_CANDIDATE_K
+    rrf_k: int = config.RRF_K
 
 
 # ==================== 状态定义 ====================
@@ -183,7 +186,7 @@ class RAGState(TypedDict):
     answer: str                         # 生成的回答
     sources: List[Dict[str, Any]]       # 来源信息
     confidence: float                   # 置信度评分
-    # ---- 新增字段 ----
+    # ---- 检索增强与自检字段 ----
     sub_queries: List[str]              # multi-query 生成的子查询
     rerank_scores: List[Dict[str, Any]] # 重排打分明细（供调试面板）
     is_hallucination: bool              # 幻觉校验结果
@@ -414,7 +417,7 @@ class Retriever:
         if len(lists) <= 1:
             return lists[0] if lists else []
         fused = bm25_helper.rrf_fuse(
-            lists, rrf_k=config.RRF_K, top_n=self.config.top_k * 2
+            lists, rrf_k=self.config.rrf_k, top_n=self.config.top_k * 2
         )
         logger.info("混合检索（单路）：%d 路融合 → %d 个候选", len(lists), len(fused))
         return fused
@@ -433,7 +436,7 @@ class Retriever:
             if not all_lists:
                 return []
             fused = bm25_helper.rrf_fuse(
-                all_lists, rrf_k=config.RRF_K, top_n=self.config.top_k * 3
+                all_lists, rrf_k=self.config.rrf_k, top_n=self.config.top_k * 3
             )
             logger.info("混合检索（多路）：%d 个子查询 × 2 路 = %d 路结果，RRF 融合 → %d 个候选",
                         len(queries), len(all_lists), len(fused))
@@ -642,7 +645,11 @@ class RAGChain:
         self.graph = None
 
     def index_documents(self, texts: List[str], metadatas: Optional[List[Dict]] = None):
-        """索引文档（兼容文本列表；若传入的是文件路径列表则走 file_loader）"""
+        """索引文档（兼容文本列表；若传入的是文件路径列表则走 file_loader）
+
+        路径判定基于后缀：当所有元素都以 .txt/.md/.pdf/.json/.csv 结尾时视为文件路径列表，
+        因此不要传入"路径与纯文本混合"的列表——混合输入会被整体当作纯文本处理。
+        """
         if texts and all(isinstance(p, str) and (p.endswith((".txt", ".md", ".pdf", ".json", ".csv"))) for p in texts):
             # 视为文件路径列表
             chunk_count = self.processor.process_paths(texts)
@@ -726,7 +733,7 @@ class RAGChain:
             return state
 
         def rerank_node(state: RAGState) -> RAGState:
-            """Reranker 节点：对检索结果重排序（优先硅基流动 /rerank API，失败时保持原顺序）"""
+            """Reranker 节点：对检索结果重排序（本地 CrossEncoder 优先，云端 API 兜底，均失败保持原顺序）"""
             if self.config.enable_reranker and state.get("documents"):
                 try:
                     docs = reranker_helper.rerank_documents(
@@ -756,7 +763,7 @@ class RAGChain:
         def generate_answer(state: RAGState) -> RAGState:
             """生成回答（LLM 异常时返回友好提示，保证流程不中断）。
 
-            幻觉重试时传入 feedback，让 LLM 在相同 context 下换一种更难幻觉的方式作答。
+            幻觉重试时传入 feedback，让 LLM 在相同 context 下以更忠实于上下文的方式重新作答。
             """
             try:
                 state["answer"] = self.generator.generate(
@@ -860,7 +867,7 @@ class RAGChain:
             "answer": "",
             "sources": [],
             "confidence": 0.0,
-            # 新增字段
+            # 检索增强与自检字段
             "sub_queries": [],
             "rerank_scores": [],
             "is_hallucination": False,

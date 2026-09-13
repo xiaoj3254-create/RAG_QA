@@ -1,14 +1,22 @@
 """Reranker 工具：Multi-Query 多查询生成 + Cross-Encoder 重排序。
 
-1. multi_query_generate：调用 LLM 生成多个角度的子查询，用于多查询召回；
-2. rerank_documents：对检索结果重排序，优先走硅基流动 /rerank HTTP API
-   （云服务、国内可直连、零本地下载），不可用时降级本地 sentence-transformers，
-   再失败则返回原顺序。
+提供两个能力：
+1. multi_query_generate —— 调用 LLM 从多个角度生成检索子查询，扩大召回覆盖；
+   失败时回退为 [原始查询]，保证主链路可用；
+2. rerank_documents —— 对召回文档做 query-doc 精打分重排，提升 top-K 相关性。
 
-设计要点：本地 sentence-transformers 依赖 torch，属重型依赖，函数内懒加载；
-任何一级失败都自动降级，不影响主链路。
+重排采用三级降级链，任何一级失败自动落入下一级，主链路不中断：
+1. 本地 sentence-transformers CrossEncoder（首选：无网络依赖、无 API 配额与费用，
+   单例缓存，进程内只加载一次；模型需已本地缓存或可联网下载）；
+2. 硅基流动 /v1/rerank HTTP API（本地模型未安装 / 加载失败 / 推理失败时的兜底；
+   配置的模型名不可用时自动切换平台可用的 BAAI/bge-reranker-v2-m3）；
+3. 保持召回原顺序返回 docs[:top_n]。
+
+设计要点：本地 sentence-transformers 依赖 torch，属重型依赖，函数内懒加载，
+未安装时直接跳过第 1 级改用云端 API，不影响主链路。
 """
 
+import threading
 from typing import List, Optional
 
 import requests
@@ -22,6 +30,11 @@ logger = setup_logger("reranker", config.LOG_FILE)
 # 本地 CrossEncoder 单例缓存：按 model_name 键存，进程内只加载一次，
 # 避免每次问答重复实例化模型（含首次联网下载）。
 _local_model_cache: dict = {}
+# 加载失败的模型名集合：本地重排是首选路径，若依赖缺失或模型下载失败，
+# 缓存失败结果可避免"每次问答都重试一次加载/下载"造成请求阻塞，
+# 后续请求直接走云端 API 兜底（重启进程可重置，便于装好依赖后重新启用）。
+_local_model_failed: set = set()
+_local_model_lock = threading.Lock()  # 串行化首次加载，防止并发请求重复实例化模型
 
 
 def multi_query_generate(original_query: str, llm, num_queries: int = 3) -> List[str]:
@@ -63,16 +76,16 @@ def rerank_documents(
     """对检索结果重排序，返回前 top_n 个文档。
 
     重排策略从高到低，任何一级失败都降级：
-    1. 硅基流动 /v1/rerank HTTP API（零下载、国内可直连；配置模型名不存在时
-       自动切换到平台可用的 BAAI/bge-reranker-v2-m3）；
-    2. 本地 sentence-transformers CrossEncoder（重型依赖，懒加载）；
+    1. 本地 sentence-transformers CrossEncoder（首选，单例缓存；模型需已在本地
+       缓存或可联网下载）；
+    2. 硅基流动 /v1/rerank HTTP API（本地不可用时的兜底，零本地下载）；
     3. 原顺序 docs[:top_n]。
 
     Args:
         query: 查询文本。
         docs: 召回阶段的文档列表。
         top_n: 重排后返回的数量。
-        model_name: 重排模型名（优先作为 API 模型名尝试）。
+        model_name: 重排模型名（本地模型名，同时作为 API 候选模型名）。
 
     Returns:
         重排后的文档列表；全部失败时降级返回 docs[:top_n]。
@@ -80,11 +93,16 @@ def rerank_documents(
     if not docs:
         return docs
 
+    ranked = _rerank_local(query, docs, top_n, model_name)
+    if ranked is not None:
+        return ranked
+
     ranked = _rerank_via_api(query, docs, top_n, model_name)
     if ranked is not None:
         return ranked
 
-    return _rerank_local(query, docs, top_n, model_name)
+    logger.warning("本地与云端重排均不可用，保持召回原顺序返回")
+    return docs[:top_n]
 
 
 def _rerank_via_api(
@@ -93,9 +111,9 @@ def _rerank_via_api(
     top_n: int,
     model_name: str,
 ) -> Optional[List[Document]]:
-    """走硅基流动 /v1/rerank HTTP API 重排。
+    """走硅基流动 /v1/rerank HTTP API 重排（第二级兜底）。
 
-    无有效 key 或请求失败返回 None，交由上层降级。模型候选为
+    无有效 key 或请求失败返回 None，交由上层降级到原顺序。模型候选为
     [配置的 model_name, BAAI/bge-reranker-v2-m3] 去重后逐个尝试，
     规避「配置了平台不存在的模型名」导致整体失败。
     """
@@ -151,7 +169,7 @@ def _rerank_via_api(
         logger.info("硅基流动 rerank(%s) 完成，返回 top-%d", m, len(out))
         return out
 
-    logger.warning("硅基流动 rerank 不可用，降级本地重排: %s", last_err)
+    logger.warning("硅基流动 rerank 不可用: %s", last_err)
     return None
 
 
@@ -159,23 +177,34 @@ def _get_local_reranker(model_name: str):
     """获取本地 CrossEncoder 单例（懒加载 + 按模型名缓存）。
 
     首次调用时加载 sentence-transformers 并实例化模型写入模块级缓存；
-    后续调用直接返回缓存实例，避免重复加载/下载。依赖缺失返回 None。
+    后续调用直接返回缓存实例，避免重复加载/下载。
+
+    依赖缺失或加载失败返回 None（并记入失败缓存，避免后续请求反复重试），
+    此时上层会自动降级到云端 rerank API。
     """
     if model_name in _local_model_cache:
         return _local_model_cache[model_name]
+    if model_name in _local_model_failed:
+        return None  # 此前已判定不可用，直接走云端兜底
     try:
         from sentence_transformers import CrossEncoder
     except ImportError as e:
-        logger.warning("sentence-transformers 未安装或加载失败，跳过重排: %s", e)
+        logger.warning("sentence-transformers 未安装，重排降级云端 API: %s", e)
+        _local_model_failed.add(model_name)
         return None
-    try:
-        model = CrossEncoder(model_name)  # CPU 可推理；模型需已在本地缓存或可联网下载
-        _local_model_cache[model_name] = model
-        logger.info("本地重排模型已加载并缓存: %s", model_name)
-        return model
-    except Exception as e:
-        logger.error("本地重排模型加载失败: %s", e)
-        return None
+    with _local_model_lock:
+        # 双检：等锁期间可能已被并发请求加载完成
+        if model_name in _local_model_cache:
+            return _local_model_cache[model_name]
+        try:
+            model = CrossEncoder(model_name)  # CPU 可推理；模型需已在本地缓存或可联网下载
+            _local_model_cache[model_name] = model
+            logger.info("本地重排模型已加载并缓存: %s", model_name)
+            return model
+        except Exception as e:
+            logger.error("本地重排模型加载失败，重排降级云端 API: %s", e)
+            _local_model_failed.add(model_name)
+            return None
 
 
 def _rerank_local(
@@ -183,11 +212,14 @@ def _rerank_local(
     docs: List[Document],
     top_n: int,
     model_name: str,
-) -> List[Document]:
-    """本地 sentence-transformers CrossEncoder 重排（失败降级原顺序）。"""
+) -> Optional[List[Document]]:
+    """本地 sentence-transformers CrossEncoder 重排（首选路径）。
+
+    模型未安装 / 加载失败 / 推理异常时返回 None，交由上层降级到云端 API。
+    """
     model = _get_local_reranker(model_name)
     if model is None:
-        return docs[:top_n]
+        return None
 
     try:
         import numpy as np
@@ -201,7 +233,8 @@ def _rerank_local(
         # 打分写入 metadata，供前端调试面板展示
         for d, s in ranked:
             d.metadata["rerank_score"] = round(float(s), 4)
+        logger.info("本地 CrossEncoder rerank(%s) 完成，返回 top-%d", model_name, top_n)
         return [d for d, _ in ranked[:top_n]]
     except Exception as e:
-        logger.error("本地重排失败，返回原顺序: %s", e)
-        return docs[:top_n]
+        logger.error("本地重排失败，降级云端 API: %s", e)
+        return None

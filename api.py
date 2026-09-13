@@ -1,13 +1,22 @@
-"""FastAPI 后端服务层：串起 RAG 核心 + SQLite 元数据存储 + 文档上传。
+"""FastAPI 后端服务层：串联 RAG 核心 + SQLite 元数据存储 + 文档上传。
 
-- /api/doc/*：文档上传与列表
-- /api/chat：问答（保存会话消息）
-- /api/session/*：会话管理
-- /health：前端连通性探测
-- /docs：FastAPI 自动生成的接口文档
+接口清单：
+- /api/doc/upload（POST）      文档上传：解析 → 分块 → 写入 Chroma → 记录元数据
+- /api/doc/list（GET）         已上传文档列表
+- /api/doc/{doc_id}（DELETE）  删除文档（同步清理 Chroma 向量与 SQLite 元数据）
+- /api/chat（POST）            问答：调用 RAGChain.query 并持久化会话消息
+- /api/session（GET/POST）     会话列表 / 新建会话
+- /api/session/{id}/history（GET）    会话历史消息
+- /api/session/{id}（DELETE）  删除会话及其全部消息
+- /health                      前端连通性探测
+- /docs                        FastAPI 自动生成的接口文档
 
-设计要点：全局单例 RAGChain（避免 Chroma/LLM 重复实例化）；
-前端参数通过 chat 请求体临时覆盖（不污染全局配置）。
+设计要点：
+- RAGChain 全局单例（双检锁构造），避免 Chroma/LLM 重复实例化；
+- 前端运行参数（chunk/top_k/开关）通过 chat 请求体临时覆盖：
+  互斥锁保护"覆盖+查询"全程，finally 中快照恢复，并发请求互不污染；
+- 文档增删与问答共用同一把锁，保证单例状态变更（retriever 重关联、建图）
+  不会与进行中的查询竞争。
 """
 import os
 import threading
@@ -97,7 +106,7 @@ def health():
 # ----------------------------------------------------------------------
 @app.post("/api/doc/upload")
 async def upload_doc(file: UploadFile = File(...)):
-    """上传并解析文档（txt/md/pdf），写入 Chroma 并记录元数据到 SQLite。"""
+    """上传并解析文档（txt/md/pdf/json/csv），写入 Chroma 并记录元数据到 SQLite。"""
     # filename 可能为空（某些客户端不携带），兜底占位名
     filename = file.filename or "unnamed"
     # 大小限制校验
@@ -184,6 +193,9 @@ def chat(req: ChatRequest):
 
     运行参数（chunk/top_k/开关）是进程内单例的临时覆盖：互斥锁保护覆盖+查询全程，
     保证并发请求不互相污染；finally 里快照恢复，避免一个会话的参数泄漏给下一个会话。
+
+    注意：chunk_size/chunk_overlap 只影响"之后上传的文档"如何分块（重建 splitter），
+    不会重新切分已入库的向量数据；top_k 与功能开关则对本次查询即时生效。
     """
     rag = get_rag()
 

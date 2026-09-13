@@ -1,8 +1,15 @@
 """Streamlit 前端：纯 HTTP 客户端，通过 requests 调用 FastAPI 接口。
 
-⚠️ 前后端分离：本模块 0 导入 main/RAG 内部类，全部通过 REST 接口与后端交互。
-侧边栏：API 连通状态、文件上传、RAG 参数面板、会话列表。
-主区域：对话气泡、来源折叠面板、调试折叠面板、聊天输入框。
+⚠️ 前后端分离：本模块零导入 main/RAG 内部类，全部通过 REST 接口与后端交互。
+
+页面结构：
+- 侧边栏：API 连通状态、文档上传/删除、RAG 参数面板、会话新建/切换/删除；
+- 主区域：对话气泡渲染；助手回答下方两个折叠面板——
+  "来源与置信度"（来源片段 + 置信度分数）和"调试信息"
+  （改写后 Query、Multi-Query 子查询、Rerank 打分明细）；底部聊天输入框。
+
+状态管理：会话历史从后端 SQLite 拉取（含助手消息的 meta 面板数据），
+切换会话时自动加载；删除会话后清空本地 session_state。
 """
 import os
 
@@ -98,6 +105,8 @@ with st.sidebar:
         st.info("暂无已上传文档")
 
     # 3. RAG 参数面板
+    # 注意：chunk_size/chunk_overlap 只影响之后上传文档的分块方式，不会重切已入库的向量；
+    # 且以下参数每次提问都会随请求发送并临时覆盖后端 .env 默认值。
     st.subheader("⚙️ RAG 参数")
     chunk_size = st.slider("chunk_size", 200, 1000, 500, step=100)
     chunk_overlap = st.slider("chunk_overlap", 0, 200, 100, step=50)
@@ -106,7 +115,7 @@ with st.sidebar:
     enable_rer = st.toggle("开启 Reranker", value=True)
 
     # 4. 会话列表
-    st.subheader("💬 会话语义")
+    st.subheader("💬 会话列表")
     if st.button("新建会话"):
         code, resp = api("POST", "/api/session", json={"session_name": "新会话"})
         if code == 200:

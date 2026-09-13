@@ -1,9 +1,18 @@
 """SQLite 元数据存储：sessions / messages / uploaded_docs 三张表。
 
-职责：只存储会话与文档的元数据，不存储向量（向量保存在 Chroma）。
-启动时调用 init_db() 自动建表（幂等）。
+职责边界：只存储会话、消息与上传文档的元数据，不存向量（向量保存在 Chroma）；
+文档通过 doc_id 与 Chroma chunk 的 metadata 建立关联。
 
-零第三方依赖，仅使用 sqlite3 标准库，保证模块可独立运行。
+表结构：
+- sessions：会话（session_id 主键）
+- messages：问答消息（外键关联会话；meta 列存 JSON，保存来源/置信度/调试信息）
+- uploaded_docs：上传文档元数据（doc_id 主键）
+
+设计要点：
+- init_db() 启动时幂等建表，并对旧库做兼容迁移（如补 messages.meta 列）；
+- 并发安全：连接开启 WAL 模式 + 外键约束 + timeout 重试，
+  适应 FastAPI 线程池下的多请求同时读写；
+- 零第三方依赖，仅使用 sqlite3 标准库，模块可独立运行。
 """
 import json
 import sqlite3

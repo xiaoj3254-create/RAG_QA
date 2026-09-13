@@ -1,16 +1,27 @@
-"""BM25 稀疏检索辅助模块：rank-bm25 + jieba 中文分词 + RRF 融合。
+"""BM25 稀疏检索辅助模块：rank-bm25 + jieba 中文分词 + RRF 多路融合。
+
+提供两个能力：
+1. BM25Helper —— 从 Chroma 语料构建并维护 BM25 稀疏检索索引（懒加载 + 脏标记重建）；
+2. rrf_fuse —— Reciprocal Rank Fusion，将多路检索结果按名次融合为一个排序列表。
+
+为什么需要 BM25（与向量检索互补）：
+- 向量检索擅长语义相关，但对"第6条"这类编号/关键词查询不敏感
+  （语义相似度对数字编号几乎没有区分度）；
+- BM25 基于词频做字面精确匹配，恰好补足这一短板；
+- 两路结果经 RRF 融合后，被多路同时命中的 chunk 排名自然靠前，
+  兼顾语义相关性与关键词命中。
 
 设计要点：
-- 语料直接取自 Chroma collection（与向量检索同一份 chunk），双路检索面向同一数据集
-- 索引懒加载：首次检索时构建，之后复用；文档增删后由 DocumentProcessor 调用
-  invalidate() 标记失效，下次检索按需重建（同时用 chunk 数做脏检测兜底）
-- 纯向量检索对"第6条"这类编号/关键词查询不敏感（语义相似度对数字编号无区分度），
-  BM25 恰好补足字面精确匹配；两路结果经 RRF 融合后兼顾语义相关性与关键词命中
-- 全链路降级：jieba/rank-bm25 缺失、索引构建失败、检索异常均返回空列表，
-  主链路自动回退纯向量检索，不影响问答可用性
+- 同一份语料：索引直接取自 Chroma collection（与向量检索同一批 chunk），
+  双路检索面向同一数据集，不会出现语料不一致；
+- 索引懒加载：首次检索时构建，之后复用；文档增删后由 DocumentProcessor
+  调用 invalidate() 标记失效，下次检索按需重建（并用 chunk 数做脏检测兜底）；
+- 并发安全：索引构建在锁内完成，调用方持有锁内快照在锁外检索，
+  即使期间索引被重建，快照内 bm25 与 docs 仍严格按行对齐；
+- 全链路降级：jieba / rank-bm25 缺失、索引构建失败、检索异常均返回空列表，
+  主链路自动回退纯向量检索，不影响问答可用性。
 """
 
-import re
 import threading
 from typing import List, Dict, Optional
 
@@ -36,53 +47,14 @@ except ImportError:
     _BM25_READY = False
 
 
-# ---------- 法条编号归一化 ----------
-# 用户查询习惯写"第6条"，而法条原文是"第六条"——阿拉伯数字与汉字数字不一致
-# 会导致 BM25 分词完全错开。检索前统一把 第N条/款/章/项 的阿拉伯数字转为汉字。
-_CN_DIGITS = "零一二三四五六七八九"
-
-
-def _arabic_to_cn(num: int) -> str:
-    """1~999 的整数转中文数字（法条编号实际范围；超出原样返回）。"""
-    if num <= 0 or num >= 1000:
-        return str(num)
-    digits = [int(d) for d in str(num)]
-    if len(digits) == 1:
-        return _CN_DIGITS[num]
-    if len(digits) == 2:
-        tens, ones = digits
-        prefix = "十" if tens == 1 else _CN_DIGITS[tens] + "十"
-        return prefix + (_CN_DIGITS[ones] if ones else "")
-    hundreds, tens, ones = digits
-    result = _CN_DIGITS[hundreds] + "百"
-    if tens == 0 and ones == 0:
-        return result
-    if tens == 0:
-        return result + "零" + _CN_DIGITS[ones]
-    result += _CN_DIGITS[tens] + "十"
-    if ones:
-        result += _CN_DIGITS[ones]
-    return result
-
-
-_LEGAL_NUM_RE = re.compile(r"第(\d+)([条款章项])")
-
-
-def _normalize_legal_numbers(text: str) -> str:
-    """第6条 → 第六条（同样处理 款/章/项），消除数字风格差异。"""
-    return _LEGAL_NUM_RE.sub(
-        lambda m: "第" + _arabic_to_cn(int(m.group(1))) + m.group(2), text
-    )
-
-
 def tokenize(text: str) -> List[str]:
-    """法条编号归一化 + 中文分词（jieba），过滤空白 token。
+    """中文分词（jieba），过滤空白 token。
 
     无 jieba 时退化为英文按空格切分。
     """
     if not _JIEBA_READY:
         return [t for t in text.split() if t.strip()]
-    return [t.strip() for t in jieba.lcut(_normalize_legal_numbers(text)) if t.strip()]
+    return [t.strip() for t in jieba.lcut(text) if t.strip()]
 
 
 class BM25Helper:
@@ -106,20 +78,25 @@ class BM25Helper:
             self._bm25 = None
             self._chunk_count = -1
 
-    def _ensure_index(self) -> bool:
-        """确保索引可用（懒构建 + chunk 数脏检测）。返回索引是否可用。"""
+    def _ensure_index(self):
+        """确保索引可用（懒构建 + chunk 数脏检测）。
+
+        返回锁内取得的 (bm25, docs) 快照；索引不可用时返回 (None, None)。
+        调用方在锁外使用快照检索：即使期间索引被 invalidate/重建，
+        快照内部 bm25 与 docs 仍严格按行对齐，不会错位。
+        """
         with self._lock:
             collection = getattr(self._vector_store, "_collection", None)
             if collection is None:
-                return False
+                return None, None
             current_count = collection.count()
             # 索引已构建且语料规模未变 → 直接复用
             if self._bm25 is not None and current_count == self._chunk_count:
-                return True
+                return self._bm25, self._docs
             if current_count == 0:
                 self._bm25 = None
                 self._chunk_count = 0
-                return False
+                return None, None
 
             data = collection.get(include=["documents", "metadatas"])
             corpus = data.get("documents") or []
@@ -132,7 +109,7 @@ class BM25Helper:
             ]
             self._chunk_count = current_count
             logger.info("BM25 索引已构建：%d 个 chunk", current_count)
-            return True
+            return self._bm25, self._docs
 
     # ---------- 检索 ----------
 
@@ -147,11 +124,12 @@ class BM25Helper:
         if not query or not query.strip():
             return []
         try:
-            if not self._ensure_index():
+            bm25, docs = self._ensure_index()
+            if bm25 is None:
                 return []
-            scores = self._bm25.get_scores(tokenize(query))
+            scores = bm25.get_scores(tokenize(query))
             top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
-            return [self._docs[i] for i in top if scores[i] > 0]
+            return [docs[i] for i in top if scores[i] > 0]
         except Exception as e:
             logger.warning("BM25 检索失败，返回空结果: %s", e)
             return []
